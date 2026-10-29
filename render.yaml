@@ -1,13 +1,23 @@
 services:
   - type: web
-    name: dap-web-platform
-    env: python
-    region: frankfurt
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    name: dap-backend
+    runtime: python
+    plan: starter            # le disque persistant nécessite un plan payant
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DAP_DEMO
+        value: "1"
+      - key: DAP_CONF
+        value: "0.80"
       - key: DAP_DATA
-        value: "/tmp/dap_data"
-      - key: DAP_MODEL
-        value: "exp.tflite"
+        value: /data
+      - key: DAP_ORIGINS
+        value: https://VOTRE-PROJET.vercel.app
+    disk:
+      name: dap-data
+      mountPath: /data
+      sizeGB: 5
