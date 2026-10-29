@@ -20,9 +20,9 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;bord
 <script>
 const $=s=>document.querySelector(s);const API=(window.DAP_API||'').replace(/\/$/,'');let T=null,ME=null,ROLE=localStorage.dapRole||'lab';localStorage.removeItem('dap');
 async function api(p,o={}){const h={'X-Demo-Role':ROLE};if(T)h.Authorization='Bearer '+T;let b=o.body;if(b&&!(b instanceof FormData)){h['Content-Type']='application/json';b=JSON.stringify(b)}
- let r;try{r=await fetch(API+'/api'+p,{method:o.method||(b?'POST':'GET'),headers:h,body:b})}catch(e){err('Serveur injoignable (réseau, CORS ou DAP_ORIGINS incorrect)');throw 0}if(r.status==401&&p!='/login'){T=null;V.login();throw 0}
+ let r;try{r=await fetch(API+'/api'+p,{method:o.method||(b?'POST':'GET'),headers:h,body:b})}catch(e){err('Serveur injoignable. Vérifiez web/config.js (adresse du serveur Render) et la variable DAP_ORIGINS sur Render.');throw 0}if(r.status==401&&p!='/login'){T=null;V.login();throw 0}
  const j=await r.json().catch(()=>({detail:'Erreur serveur '+r.status}));if(!r.ok){err(j.detail||'Erreur');throw 0}return j}
-const err=m=>{const e=$('#err');if(e)e.textContent=typeof m=='string'?m:JSON.stringify(m)};
+const err=m=>{m=typeof m=='string'?m:JSON.stringify(m);const e=$('#err');if(e)e.textContent=m;else $('#app').innerHTML='<main><div class=card><h2>Erreur</h2><p style="color:var(--r)">'+E(m)+'</p><p class=m>API utilisée : '+E(API||location.origin)+'</p></div></main>'};
 const E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const D=t=>t?new Date(t*1000).toLocaleString('fr-DZ'):'';const tag=s=>`<span class="tag ${s}">${E(({confirmed:'confirmé',rejected:'infirmé',auto:'IA (non confirmé)'})[s]||s)}</span>`;
 const F=id=>`${API}/api/files/${id}?t=${T||''}&r=${ROLE}`;
