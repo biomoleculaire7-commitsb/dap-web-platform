@@ -9,13 +9,18 @@ from detector import Detector, draw
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DAP_DATA", os.path.join(BASE, "data")); os.makedirs(DATA + "/files", exist_ok=True)
-MODEL = os.environ.get("DAP_MODEL", os.path.join(BASE, "model/exp.tflite"))
+def find_model():
+    import glob
+    c = [os.environ.get("DAP_MODEL"), os.path.join(BASE, "model/exp.tflite"), os.path.join(BASE, "exp.tflite")] + glob.glob(BASE + "/**/*.tflite", recursive=True)
+    for p in c:
+        if p and os.path.isfile(p) and os.path.getsize(p) > 1_000_000: return p
+    raise FileNotFoundError("exp.tflite introuvable ou vide dans " + BASE + " (fichiers .tflite: " + str([(p, os.path.getsize(p)) for p in glob.glob(BASE + "/**/*.tflite", recursive=True)]) + ")")
 app = FastAPI(title="DAP - Diagnostic Automatique des Parasites"); _det = None
 app.add_middleware(CORSMiddleware, allow_origins=os.environ.get('DAP_ORIGINS', '*').split(','), allow_methods=['*'], allow_headers=['*'])
 
 def det():
     global _det
-    if _det is None: _det = Detector(MODEL)
+    if _det is None: _det = Detector(find_model())
     return _det
 
 def q(sql, a=(), one=False):
@@ -61,7 +66,7 @@ def session(uid):
 
 @app.get("/api/health")
 def health():
-    try: d = det(); return {"model": "ok", "input": [int(x) for x in d.inp["shape"]], "classes": len(__import__("detector").LABELS)}
+    try: d = det(); return {"model": "ok", "path": find_model(), "size": os.path.getsize(find_model()), "input": [int(x) for x in d.inp["shape"]], "classes": len(__import__("detector").LABELS)}
     except Exception as e: raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 @app.post("/api/register")
