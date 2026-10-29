@@ -1,1 +1,1 @@
-   window.DAP_API = 'https://dap-backend-xxxx.onrender.com';
+ window.DAP_API = 'https://dap-web-platform.onrender.com';
