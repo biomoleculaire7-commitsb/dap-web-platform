@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from detector import Detector, draw
 
@@ -10,6 +11,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("DAP_DATA", os.path.join(BASE, "data")); os.makedirs(DATA + "/files", exist_ok=True)
 MODEL = os.environ.get("DAP_MODEL", os.path.join(BASE, "model/exp.tflite"))
 app = FastAPI(title="DAP - Diagnostic Automatique des Parasites"); _det = None
+app.add_middleware(CORSMiddleware, allow_origins=os.environ.get('DAP_ORIGINS', '*').split(','), allow_methods=['*'], allow_headers=['*'])
 
 def det():
     global _det
@@ -56,6 +58,11 @@ class Report(BaseModel): verdict: str; report: str; findings: List[dict] = []  #
 
 def session(uid):
     t = secrets.token_hex(24); q("INSERT INTO sessions VALUES(?,?)", (t, uid)); return t
+
+@app.get("/api/health")
+def health():
+    try: d = det(); return {"model": "ok", "input": [int(x) for x in d.inp["shape"]], "classes": len(__import__("detector").LABELS)}
+    except Exception as e: raise HTTPException(500, f"{type(e).__name__}: {e}")
 
 @app.post("/api/register")
 def register(r: Reg):
@@ -125,7 +132,8 @@ async def upload(cid: int, files: List[UploadFile] = File(...), u=Depends(user))
     return {"results": out}
 
 def analyse(cid, parent, img, name, frame=False):
-    d = det()(img)
+    try: d = det()(img)
+    except Exception as e: raise HTTPException(500, f"Échec du modèle IA : {type(e).__name__}: {e}")
     if frame and not d: return {"name": name, "n": 0}
     fid = q("INSERT INTO files(case_id,name,kind,path,parent) VALUES(?,?,?,?,?)", (cid, name, "annotée", "", parent))
     p = f"{DATA}/files/{fid}_ann.jpg"; cv2.imwrite(p, draw(img, d)); q("UPDATE files SET path=? WHERE id=?", (p, fid))
@@ -175,4 +183,4 @@ def stats(u=Depends(user)):
             "confirmed": q("SELECT COUNT(*) n FROM findings f JOIN cases c ON c.id=f.case_id WHERE c.lab_id=? AND f.status='confirmed'", (l,), True)["n"],
             "by_parasite": q("SELECT parasite,COUNT(*) n FROM findings WHERE status='confirmed' GROUP BY parasite ORDER BY n DESC")}
 
-app.mount("/", StaticFiles(directory=BASE + "/static", html=True))
+if os.path.isdir(BASE + "/static"): app.mount("/", StaticFiles(directory=BASE + "/static", html=True))
