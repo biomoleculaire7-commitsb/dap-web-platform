@@ -40,9 +40,21 @@ for s in ["""CREATE TABLE IF NOT EXISTS labs(id INTEGER PRIMARY KEY, name, type,
 
 def hp(pw, salt): return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 120000).hex()
 
-def user(authorization: str = Header(None), t: str = Query(None)):
+DEMO = os.environ.get("DAP_DEMO", "1") == "1"  # 1 = accès direct sans connexion (test) ; 0 = connexion obligatoire
+_UQ = "SELECT u.*,l.name lab_name,l.has_expert FROM users u JOIN labs l ON l.id=u.lab_id "
+
+def seed_demo():
+    if q("SELECT 1 FROM users WHERE email='demo@dap.local'", (), True): return
+    for name, ex, email, role, uname in [("Laboratoire Démo", 0, "demo@dap.local", "admin", "Technicien Démo"), ("Hôpital Expert Démo", 1, "expert@dap.local", "expert", "Dr Expert Démo")]:
+        lid = q("INSERT INTO labs(name,type,wilaya,address,phone,has_expert,created) VALUES(?,?,?,?,?,?,?)", (name, "Hôpital" if ex else "Laboratoire", "Relizane", "", "", ex, time.time()))
+        q("INSERT INTO users(lab_id,name,email,salt,pw,role) VALUES(?,?,?,?,?,?)", (lid, uname, email, "x", "x", role))
+if DEMO: seed_demo()
+
+def user(authorization: str = Header(None), t: str = Query(None), x_demo_role: str = Header(None), r: str = Query(None)):
     tok = (authorization or "").replace("Bearer ", "") or t
-    u = q("SELECT u.*,l.name lab_name,l.has_expert FROM sessions s JOIN users u ON u.id=s.user_id JOIN labs l ON l.id=u.lab_id WHERE s.token=?", (tok,), True)
+    u = q(_UQ.replace("FROM users u", "FROM sessions s JOIN users u ON u.id=s.user_id") + "WHERE s.token=?", (tok,), True) if tok else None
+    if not u and DEMO:
+        u = q(_UQ + "WHERE u.email=?", ("expert@dap.local" if (x_demo_role or r) == "expert" else "demo@dap.local",), True)
     if not u: raise HTTPException(401, "Non authentifié")
     return u
 
@@ -116,8 +128,9 @@ def case(cid: int, u=Depends(user)):
             "findings": q("SELECT id,file_id,parasite,conf,status FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review}
 
 @app.post("/api/cases/{cid}/files")
-async def upload(cid: int, files: List[UploadFile] = File(...), u=Depends(user)):
+async def upload(cid: int, files: List[UploadFile] = File(default=[]), u=Depends(user)):
     c = access(cid, u)
+    if not files: raise HTTPException(400, "Aucun fichier reçu : choisissez une image avant de cliquer sur Téléverser")
     if c["lab_id"] != u["lab_id"]: raise HTTPException(403)
     out = []
     for f in files:
