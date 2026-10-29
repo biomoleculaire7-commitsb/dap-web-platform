@@ -4,14 +4,15 @@ LABELS = [l.strip() for l in open(os.path.join(os.path.dirname(__file__), "label
 
 class Detector:
     """YOLOv8 TFLite (input 1x3x640x640 float32, output 1x23x8400 = 4 box + 19 classes)."""
-    def __init__(s, path, conf=.25, iou=.45):
+    def __init__(s, path, conf=None, iou=.45):
         s.i = Interpreter(model_path=path, num_threads=4); s.i.allocate_tensors()
         s.inp = s.i.get_input_details()[0]; s.out = s.i.get_output_details()[0]
         sh = s.inp["shape"]; s.nchw = sh[1] == 3; s.size = int(sh[2] if s.nchw else sh[1])
-        s.conf, s.iou = conf, iou
+        s.conf, s.iou = conf if conf is not None else float(os.environ.get('DAP_CONF', .80)), iou
+        s.train = int(os.environ.get('DAP_TRAIN_SIZE', 640))  # taille d'entraînement : l'image est réduite à cette taille puis placée sur le canevas du modèle
 
     def __call__(s, img):
-        h, w = img.shape[:2]; r = s.size / max(h, w); nh, nw = int(h * r), int(w * r)
+        h, w = img.shape[:2]; r = min(s.size, s.train) / max(h, w); nh, nw = int(h * r), int(w * r)
         py, px = (s.size - nh) // 2, (s.size - nw) // 2
         can = np.full((s.size, s.size, 3), 114, np.uint8); can[py:py+nh, px:px+nw] = cv2.resize(img, (nw, nh))
         x = cv2.cvtColor(can, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
