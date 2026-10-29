@@ -1,0 +1,1 @@
+window.DAP_API = '';
