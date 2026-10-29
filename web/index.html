@@ -18,16 +18,17 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;bord
 .bar{height:10px;background:var(--p2);border-radius:5px}
 </style></head><body><div id="app"></div><script src="config.js"></script>
 <script>
-const $=s=>document.querySelector(s);const API=(window.DAP_API||'').replace(/\/$/,'');let T=localStorage.dap,ME=null;
-async function api(p,o={}){const h={Authorization:'Bearer '+T};let b=o.body;if(b&&!(b instanceof FormData)){h['Content-Type']='application/json';b=JSON.stringify(b)}
- let r;try{r=await fetch(API+'/api'+p,{method:o.method||(b?'POST':'GET'),headers:h,body:b})}catch(e){err('Serveur injoignable (réseau, CORS ou DAP_ORIGINS incorrect)');throw 0}if(r.status==401&&T){logout();throw 0}
+const $=s=>document.querySelector(s);const API=(window.DAP_API||'').replace(/\/$/,'');let T=null,ME=null,ROLE=localStorage.dapRole||'lab';localStorage.removeItem('dap');
+async function api(p,o={}){const h={'X-Demo-Role':ROLE};if(T)h.Authorization='Bearer '+T;let b=o.body;if(b&&!(b instanceof FormData)){h['Content-Type']='application/json';b=JSON.stringify(b)}
+ let r;try{r=await fetch(API+'/api'+p,{method:o.method||(b?'POST':'GET'),headers:h,body:b})}catch(e){err('Serveur injoignable (réseau, CORS ou DAP_ORIGINS incorrect)');throw 0}if(r.status==401&&p!='/login'){T=null;V.login();throw 0}
  const j=await r.json().catch(()=>({detail:'Erreur serveur '+r.status}));if(!r.ok){err(j.detail||'Erreur');throw 0}return j}
 const err=m=>{const e=$('#err');if(e)e.textContent=typeof m=='string'?m:JSON.stringify(m)};
 const E=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const D=t=>t?new Date(t*1000).toLocaleString('fr-DZ'):'';const tag=s=>`<span class="tag ${s}">${E(({confirmed:'confirmé',rejected:'infirmé',auto:'IA (non confirmé)'})[s]||s)}</span>`;
-const F=id=>`${API}/api/files/${id}?t=${T}`;
+const F=id=>`${API}/api/files/${id}?t=${T||''}&r=${ROLE}`;
+function swRole(){ROLE=ROLE=='expert'?'lab':'expert';localStorage.dapRole=ROLE;boot()}
 function logout(){localStorage.removeItem('dap');T=null;ME=null;go('login')}
-function shell(h,on){$('#app').innerHTML=`<header><b>DAP</b>${[['dash','Tableau de bord'],['cases','Dossiers'],['new','Nouveau dossier'],['inbox','Expertises reçues'],['db','Base parasites'],['team','Laboratoire']].map(([k,l])=>`<a class="${on==k?'on':''}" onclick="go('${k}')">${l}</a>`).join('')}<span class="sp"></span><span>${E(ME.lab_name)} · ${E(ME.name)}</span><a onclick="logout()">Déconnexion</a></header><main><div id="err"></div>${h}</main>`}
+function shell(h,on){$('#app').innerHTML=`<header><b>DAP</b>${[['dash','Tableau de bord'],['cases','Dossiers'],['new','Nouveau dossier'],['inbox','Expertises reçues'],['db','Base parasites'],['team','Laboratoire']].map(([k,l])=>`<a class="${on==k?'on':''}" onclick="go('${k}')">${l}</a>`).join('')}<span class="sp"></span><span>${E(ME.lab_name)} · ${E(ME.name)}</span><a onclick="swRole()">Mode démo : passer en ${ROLE=='expert'?'Laboratoire':'Expert'}</a></header><main><div id="err"></div>${h}</main>`}
 async function go(v,id){location.hash=v+(id?'/'+id:'');await V[v](id)}
 const V={
 async login(){$('#app').innerHTML=`<main style="max-width:420px"><div class="card"><h2>DAP — Connexion</h2><label>E-mail</label><input id=e><label>Mot de passe</label><input id=p type=password><div id=err></div><button onclick="doLogin()">Se connecter</button> <button class=s onclick="V.reg()">Inscrire mon laboratoire</button></div></main>`},
@@ -55,6 +56,6 @@ async function up(id){if(!$('#fl').files.length){err('Choisissez au moins un fic
 async function snd(id){try{await api(`/cases/${id}/refer`,{body:{to_lab:+v('#tl'),message:v('#tm')}});go('case',id)}catch(e){}}
 async function rep(rid,id){const fs=[...document.querySelectorAll('input[type=radio]:checked')].map(x=>({id:+x.name.slice(1),status:x.value}));try{await api(`/referrals/${rid}/report`,{body:{verdict:v('#vd'),report:v('#rp'),findings:fs}});go('case',id)}catch(e){}}
 async function au(){try{await api('/users',{body:{name:v('#nn'),email:v('#ne'),password:v('#np'),role:v('#nr')}});alert('Utilisateur ajouté')}catch(e){}}
-async function boot(){if(!T)return V.login();try{ME=await api('/me')}catch(e){return}const[h,id]=(location.hash.slice(1)||'dash').split('/');go(V[h]?h:'dash',id)}
+async function boot(){try{ME=await api('/me')}catch(e){return}const[h,id]=(location.hash.slice(1)||'dash').split('/');go(V[h]?h:'dash',id)}
 boot();
 </script></body></html>
