@@ -4,3 +4,4 @@ python-multipart
 ai-edge-litert
 opencv-python-headless
 numpy
+reportlab
