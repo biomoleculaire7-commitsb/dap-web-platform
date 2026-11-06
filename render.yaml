@@ -9,14 +9,20 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: DAP_DEMO
-        value: "1"
-      - key: DAP_CONF
-        value: "0.80"
       - key: DAP_DATA
         value: /data
+      - key: DAP_CONF
+        value: "0.80"
       - key: DAP_ORIGINS
         value: https://VOTRE-PROJET.vercel.app
+      - key: DAP_CENTRAL_EMAIL
+        sync: false
+      - key: DAP_CENTRAL_PASSWORD
+        sync: false
+      - key: DAP_SEED_DEMO
+        value: "1"           # comptes de démonstration ; mettre 0 pour une utilisation réelle
+      - key: DAP_DEMO_PASSWORD
+        sync: false
     disk:
       name: dap-data
       mountPath: /data
