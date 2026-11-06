@@ -350,23 +350,37 @@ def ds_zip(u=Depends(central)):
 
 _F = {}
 def _fonts():
+    """Polices du PDF : DejaVu (arabe + latin) ; repli sur Helvetica (sans arabe) si les fichiers de police sont introuvables."""
     if _F: return
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    pdfmetrics.registerFont(TTFont("DJ", BASE + "/fonts/DejaVuSans.ttf")); pdfmetrics.registerFont(TTFont("DJB", BASE + "/fonts/DejaVuSans-Bold.ttf")); _F["ok"] = 1
+    for d in (BASE + "/fonts", "/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu"):
+        try:
+            pdfmetrics.registerFont(TTFont("DJ", d + "/DejaVuSans.ttf")); pdfmetrics.registerFont(TTFont("DJB", d + "/DejaVuSans-Bold.ttf"))
+            _F.update(n="DJ", b="DJB", ar=True); return
+        except Exception: continue
+    _F.update(n="Helvetica", b="Helvetica-Bold", ar=False)
 
 def T(t):
     """Texte pour PDF : met en forme l'arabe (lettres liées + sens droite-gauche), échappe le XML."""
     from xml.sax.saxutils import escape as X
     t = str(t or "")
-    if any("\u0600" <= ch <= "\u06ff" for ch in t):
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-        t = "\n".join(get_display(arabic_reshaper.reshape(l)) for l in t.split("\n"))
+    if _F.get("ar") and any("\u0600" <= ch <= "\u06ff" for ch in t):
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            t = "\n".join(get_display(arabic_reshaper.reshape(l)) for l in t.split("\n"))
+        except ImportError: pass
+    elif not _F.get("ar"): t = t.encode("latin-1", "replace").decode("latin-1")   # polices de repli : caractères non latins remplacés
     return X(t).replace("\n", "<br/>")
 
 @app.get("/api/cases/{cid}/report.pdf")
 def report_pdf(cid: int, u=Depends(user)):
+    try: return _report_pdf(cid, u)
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, f"Erreur de génération du PDF : {type(e).__name__}: {e}")
+
+def _report_pdf(cid, u):
     """Compte rendu d'examen parasitologique des selles, mise en page type compte rendu de laboratoire algérien (bilingue FR/AR)."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
@@ -376,7 +390,7 @@ def report_pdf(cid: int, u=Depends(user)):
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RI, KeepTogether
     _fonts(); c = access(cid, u); audit(u, "report_pdf", cid)
     lab = q("SELECT * FROM labs WHERE id=?", (c["lab_id"],), True)
-    P = lambda size=9, bold=False, **k: ParagraphStyle("p", fontName="DJB" if bold else "DJ", fontSize=size, leading=size * 1.4, **k)
+    P = lambda size=9, bold=False, **k: ParagraphStyle("p", fontName=_F["b"] if bold else _F["n"], fontSize=size, leading=size * 1.4, **k)
     N, B = P(9), P(9, True)
     exp = q("SELECT r.*,b.name to_name,b.wilaya to_wilaya,e.name expert_name FROM referrals r JOIN labs b ON b.id=r.to_lab LEFT JOIN users e ON e.id=r.expert_id WHERE r.case_id=? AND r.status='expertisé' ORDER BY r.id DESC LIMIT 1", (cid,), True)
     fs = q("SELECT parasite,conf,status FROM findings WHERE case_id=? AND status!='rejected' ORDER BY status,conf DESC", (cid,))
@@ -399,7 +413,7 @@ def report_pdf(cid: int, u=Depends(user)):
     rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut"]] + [[Paragraph(T(x["parasite"]), N), "%d %%" % round(x["conf"] * 100), lbl.get(x["status"], x["status"])] for x in fs]
     if not fs: rows.append([Paragraph("Absence d'élément parasitaire détecté sur les images analysées / " + T("لم يتم الكشف عن أي طفيلي"), N), "", ""])
     tb = Table(rows, colWidths=[9*cm, 3*cm, 5*cm], repeatRows=1)
-    tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), "DJ"), ("FONTNAME", (0, 0), (-1, 0), "DJB"), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2f3f1")), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); S += [tb, Spacer(1, 8)]
+    tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _F["n"]), ("FONTNAME", (0, 0), (-1, 0), _F["b"]), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2f3f1")), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); S += [tb, Spacer(1, 8)]
     S += [Paragraph("CONCLUSION / " + T("الخلاصة"), P(10, True)), Spacer(1, 3)]
     if exp: S += [Paragraph(T(exp["verdict"] or ""), B), Paragraph(T(exp["report"] or ""), N)]
     else: S += [Paragraph("Résultat PRÉLIMINAIRE établi par intelligence artificielle, non encore validé par un médecin expert. Ne pas utiliser seul pour une décision thérapeutique.", B)]
