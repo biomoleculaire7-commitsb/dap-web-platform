@@ -1,3 +1,4 @@
+
 fastapi
 uvicorn[standard]
 python-multipart
@@ -5,3 +6,5 @@ ai-edge-litert
 opencv-python-headless
 numpy
 reportlab
+arabic-reshaper
+python-bidi
