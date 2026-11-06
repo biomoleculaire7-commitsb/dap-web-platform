@@ -308,6 +308,12 @@ def c_lab_review(lid: int, r: Review, u=Depends(central)):
     if not st: raise HTTPException(400)
     q("UPDATE labs SET status=? WHERE id=? AND type!='Central'", (st, lid)); audit(u, "lab_" + r.action, lid); return {"ok": True}
 
+class ExpertFlag(BaseModel): value: bool
+
+@app.post("/api/central/labs/{lid}/expert")
+def c_lab_expert(lid: int, r: ExpertFlag, u=Depends(central)):
+    q("UPDATE labs SET has_expert=? WHERE id=? AND type!='Central'", (int(r.value), lid)); audit(u, "lab_expert_" + str(r.value), lid); return {"ok": True}
+
 @app.get("/api/central/annotations")
 def c_ann(review: str = "pending", u=Depends(central)):
     return q("""SELECT a.file_id,a.review,COUNT(*) boxes,GROUP_CONCAT(DISTINCT a.label) labels,l.name lab,e.name expert,MAX(a.created) created
