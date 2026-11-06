@@ -41,9 +41,17 @@ for s in ["""CREATE TABLE IF NOT EXISTS labs(id INTEGER PRIMARY KEY, name, type,
     q(s)
 
 q("CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY, case_id INT, file_id INT, label, x0 REAL, y0 REAL, x1 REAL, y1 REAL, expert_id INT, created REAL)")
+for m in ["ALTER TABLE labs ADD COLUMN status", "ALTER TABLE sessions ADD COLUMN created REAL", "ALTER TABLE annotations ADD COLUMN review", "ALTER TABLE annotations ADD COLUMN reviewed_by INT", "ALTER TABLE annotations ADD COLUMN reviewed_at REAL"]:
+    try: q(m)
+    except Exception: pass
+q("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, user_id INT, lab_id INT, action, target, ts REAL)")
+q("UPDATE labs SET status='approved' WHERE status IS NULL")
+q("UPDATE annotations SET review='pending' WHERE review IS NULL")
+
 try: q("ALTER TABLE files ADD COLUMN raw")
 except Exception: pass
-DS = DATA + "/dataset"; os.makedirs(DS + "/images", exist_ok=True); os.makedirs(DS + "/labels", exist_ok=True)
+DS = DATA + "/dataset"; os.makedirs(DS + "/images", exist_ok=True); os.makedirs(DS + "/labels", exist_ok=True)   # dataset APPROUVÉ (seul exportable)
+PD = DATA + "/dataset_pending"; os.makedirs(PD + "/images", exist_ok=True); os.makedirs(PD + "/labels", exist_ok=True)  # en attente de validation centrale
 # LISTE MAÎTRESSE (ajout en fin de liste uniquement : les index 0-18 = modèle actuel ; ne jamais réordonner)
 EXTRA = ["Schistosoma mansoni", "Schistosoma haematobium", "Schistosoma japonicum", "Clonorchis sinensis", "Fasciola hepatica", "Dicrocoelium dendriticum",
          "Diphyllobothrium latum", "Dipylidium caninum", "Trichostrongylus spp.", "Heterophyes heterophyes", "Metagonimus yokogawai", "Toxocara spp.",
@@ -55,27 +63,52 @@ CLASSES = LABELS + EXTRA + OTHER
 
 def hp(pw, salt): return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 120000).hex()
 
-DEMO = os.environ.get("DAP_DEMO", "1") == "1"  # 1 = accès direct sans connexion (test) ; 0 = connexion obligatoire
-_UQ = "SELECT u.*,l.name lab_name,l.has_expert FROM users u JOIN labs l ON l.id=u.lab_id "
+DEMO = os.environ.get("DAP_DEMO", "0") == "1"  # 1 = accès direct sans connexion (déconseillé) ; 0 = connexion obligatoire
+SESSION_H = float(os.environ.get("DAP_SESSION_HOURS", 12))
+_UQ = "SELECT u.*,l.name lab_name,l.has_expert,l.status lab_status FROM users u JOIN labs l ON l.id=u.lab_id "
 
-def seed_demo():
-    if q("SELECT 1 FROM users WHERE email='demo@dap.local'", (), True): return
-    for name, ex, email, role, uname in [("Laboratoire Démo", 0, "demo@dap.local", "admin", "Technicien Démo"), ("Hôpital Expert Démo", 1, "expert@dap.local", "expert", "Dr Expert Démo")]:
-        lid = q("INSERT INTO labs(name,type,wilaya,address,phone,has_expert,created) VALUES(?,?,?,?,?,?,?)", (name, "Hôpital" if ex else "Laboratoire", "Relizane", "", "", ex, time.time()))
-        q("INSERT INTO users(lab_id,name,email,salt,pw,role) VALUES(?,?,?,?,?,?)", (lid, uname, email, "x", "x", role))
-if DEMO: seed_demo()
+def mk_user(lab_id, name, email, pw, role):
+    salt = secrets.token_hex(8)
+    return q("INSERT INTO users(lab_id,name,email,salt,pw,role) VALUES(?,?,?,?,?,?)", (lab_id, name, email, salt, hp(pw, salt), role))
 
-def user(authorization: str = Header(None), t: str = Query(None), x_demo_role: str = Header(None), r: str = Query(None)):
+def seed():
+    ce = os.environ.get("DAP_CENTRAL_EMAIL", "central@dap.local"); cp = os.environ.get("DAP_CENTRAL_PASSWORD")
+    if not q("SELECT 1 FROM users WHERE role='central'", (), True):
+        if not cp: cp = secrets.token_urlsafe(9); print(f"[DAP] Compte central créé : {ce} / {cp}  (définissez DAP_CENTRAL_PASSWORD pour le fixer)", flush=True)
+        lid = q("INSERT INTO labs(name,type,wilaya,has_expert,created,status) VALUES(?,?,?,?,?,?)", ("Administration centrale DAP", "Central", "", 0, time.time(), "approved"))
+        mk_user(lid, "Administrateur central", ce, cp, "central")
+    if os.environ.get("DAP_SEED_DEMO", "0") == "1" and not q("SELECT 1 FROM users WHERE email='labo@dap.local'", (), True):
+        dp = os.environ.get("DAP_DEMO_PASSWORD", "demo1234")
+        for name, ex, email, role, uname in [("Laboratoire Démo", 0, "labo@dap.local", "admin", "Technicien Démo"), ("Hôpital Expert Démo", 1, "expert@dap.local", "expert", "Dr Expert Démo")]:
+            lid = q("INSERT INTO labs(name,type,wilaya,has_expert,created,status) VALUES(?,?,?,?,?,?)", (name, "Hôpital" if ex else "Laboratoire", "Relizane", ex, time.time(), "approved"))
+            mk_user(lid, uname, email, dp, role)
+        print(f"[DAP] Comptes démo : labo@dap.local et expert@dap.local / {dp}", flush=True)
+seed()
+
+def audit(u, action, target=""):
+    try: q("INSERT INTO audit(user_id,lab_id,action,target,ts) VALUES(?,?,?,?,?)", (u["id"], u["lab_id"], action, str(target), time.time()))
+    except Exception: pass
+
+def user(authorization: str = Header(None), t: str = Query(None)):
     tok = (authorization or "").replace("Bearer ", "") or t
     u = q(_UQ.replace("FROM users u", "FROM sessions s JOIN users u ON u.id=s.user_id") + "WHERE s.token=?", (tok,), True) if tok else None
-    if not u and DEMO:
-        u = q(_UQ + "WHERE u.email=?", ("expert@dap.local" if (x_demo_role or r) == "expert" else "demo@dap.local",), True)
-    if not u: raise HTTPException(401, "Non authentifié")
+    if u:
+        ss = q("SELECT created FROM sessions WHERE token=?", (tok,), True)
+        if ss and ss["created"] and time.time() - ss["created"] > SESSION_H * 3600:
+            q("DELETE FROM sessions WHERE token=?", (tok,)); u = None
+    if not u and DEMO: u = q(_UQ + "WHERE u.email='labo@dap.local'", (), True)
+    if not u: raise HTTPException(401, "Session expirée ou non authentifié")
+    if u["lab_status"] != "approved": raise HTTPException(403, "Établissement non approuvé")
+    return u
+
+def central(u=Depends(user)):
+    if u["role"] != "central": raise HTTPException(403, "Réservé à l'administration centrale")
     return u
 
 def access(cid, u):
     c = q("SELECT * FROM cases WHERE id=?", (cid,), True)
     if not c: raise HTTPException(404)
+    if u["role"] == "central": raise HTTPException(403, "L'administration centrale n'accède pas aux dossiers patients")
     if c["lab_id"] != u["lab_id"] and not q("SELECT 1 FROM referrals WHERE case_id=? AND to_lab=?", (cid, u["lab_id"]), True): raise HTTPException(403)
     return c
 
@@ -89,7 +122,7 @@ class Refer(BaseModel): to_lab: int; message: str = ""
 class Report(BaseModel): verdict: str; report: str; findings: List[dict] = []  # [{id, status: confirmed|rejected}]
 
 def session(uid):
-    t = secrets.token_hex(24); q("INSERT INTO sessions VALUES(?,?)", (t, uid)); return t
+    t = secrets.token_hex(24); q("INSERT INTO sessions(token,user_id,created) VALUES(?,?,?)", (t, uid, time.time())); return t
 
 @app.get("/api/health")
 def health():
@@ -98,31 +131,44 @@ def health():
 
 @app.post("/api/register")
 def register(r: Reg):
-    if q("SELECT 1 FROM users WHERE email=?", (r.email,), True): raise HTTPException(409, "E-mail déjà utilisé")
-    lid = q("INSERT INTO labs(name,type,wilaya,address,phone,has_expert,created) VALUES(?,?,?,?,?,?,?)", (r.lab_name, r.type, r.wilaya, r.address, r.phone, int(r.has_expert), time.time()))
-    salt = secrets.token_hex(8)
-    uid = q("INSERT INTO users(lab_id,name,email,salt,pw,role) VALUES(?,?,?,?,?,?)", (lid, r.name, r.email, salt, hp(r.password, salt), "admin"))
-    return {"token": session(uid)}
+    if len(r.password) < 8: raise HTTPException(400, "Mot de passe : 8 caractères minimum")
+    if q("SELECT 1 FROM users WHERE email=?", (r.email.strip().lower(),), True): raise HTTPException(409, "E-mail déjà utilisé")
+    lid = q("INSERT INTO labs(name,type,wilaya,address,phone,has_expert,created,status) VALUES(?,?,?,?,?,?,?,?)", (r.lab_name, r.type, r.wilaya, r.address, r.phone, int(r.has_expert), time.time(), "pending"))
+    mk_user(lid, r.name, r.email.strip().lower(), r.password, "admin")
+    return {"pending": True, "message": "Demande enregistrée. Votre établissement sera activé après validation par l'administration centrale."}
 
 @app.post("/api/login")
 def login(l: Login):
-    u = q("SELECT * FROM users WHERE email=?", (l.email,), True)
+    u = q(_UQ + "WHERE u.email=?", (l.email.strip().lower(),), True)
     if not u or hp(l.password, u["salt"]) != u["pw"]: raise HTTPException(401, "Identifiants invalides")
-    return {"token": session(u["id"])}
+    if u["lab_status"] == "pending": raise HTTPException(403, "Établissement en attente de validation par l'administration centrale")
+    if u["lab_status"] != "approved": raise HTTPException(403, "Établissement non approuvé")
+    audit(u, "login"); return {"token": session(u["id"])}
+
+@app.post("/api/logout")
+def logout(authorization: str = Header(None)):
+    q("DELETE FROM sessions WHERE token=?", ((authorization or "").replace("Bearer ", ""),)); return {"ok": True}
 
 @app.get("/api/me")
 def me(u=Depends(user)): return {k: u[k] for k in ("id", "name", "email", "role", "lab_id", "lab_name", "has_expert")}
+
+@app.get("/api/team")
+def team(u=Depends(user)):
+    if u["role"] != "admin": raise HTTPException(403)
+    return q("SELECT id,name,email,role FROM users WHERE lab_id=? ORDER BY id", (u["lab_id"],))
 
 @app.post("/api/users")
 def add_user(n: NewUser, u=Depends(user)):
     if u["role"] != "admin": raise HTTPException(403)
     if n.role not in ("tech", "expert"): raise HTTPException(400)
-    salt = secrets.token_hex(8)
-    q("INSERT INTO users(lab_id,name,email,salt,pw,role) VALUES(?,?,?,?,?,?)", (u["lab_id"], n.name, n.email, salt, hp(n.password, salt), n.role)); return {"ok": True}
+    if len(n.password) < 8: raise HTTPException(400, "Mot de passe : 8 caractères minimum")
+    if q("SELECT 1 FROM users WHERE email=?", (n.email.strip().lower(),), True): raise HTTPException(409, "E-mail déjà utilisé")
+    if n.role == "expert" and not u["has_expert"]: raise HTTPException(400, "Établissement non déclaré comme disposant d'un expert")
+    mk_user(u["lab_id"], n.name, n.email.strip().lower(), n.password, n.role); audit(u, "add_user", n.email); return {"ok": True}
 
 @app.get("/api/labs")
 def labs(u=Depends(user)):
-    return q("SELECT id,name,type,wilaya,has_expert FROM labs WHERE has_expert=1 AND id!=?", (u["lab_id"],))
+    return q("SELECT id,name,type,wilaya,has_expert FROM labs WHERE has_expert=1 AND status='approved' AND id!=?", (u["lab_id"],))
 
 @app.post("/api/cases")
 def new_case(c: NewCase, u=Depends(user)):
@@ -136,7 +182,7 @@ def cases(u=Depends(user)):
 
 @app.get("/api/cases/{cid}")
 def case(cid: int, u=Depends(user)):
-    c = access(cid, u); own = c["lab_id"] == u["lab_id"]
+    c = access(cid, u); own = c["lab_id"] == u["lab_id"]; audit(u, "view_case", cid)
     refs = q("SELECT r.*,a.name from_name,b.name to_name FROM referrals r JOIN labs a ON a.id=r.from_lab JOIN labs b ON b.id=r.to_lab WHERE case_id=? ORDER BY r.id DESC", (cid,))
     can_review = any(r["to_lab"] == u["lab_id"] and r["status"] == "en_attente" for r in refs) and u["role"] in ("expert", "admin")
     return {"case": c, "own": own, "files": q("SELECT id,name,kind,parent FROM files WHERE case_id=?", (cid,)),
@@ -180,7 +226,10 @@ def analyse(cid, parent, img, name, frame=False, raw=None):
 def get_file(fid: int, raw: int = Query(0), u=Depends(user)):
     f = q("SELECT * FROM files WHERE id=?", (fid,), True)
     if not f: raise HTTPException(404)
-    access(f["case_id"], u); return FileResponse((f["raw"] if raw and f["raw"] else f["path"]), filename=f["name"] if f["kind"] == "doc" else None)
+    if u["role"] == "central":
+        if not q("SELECT 1 FROM annotations WHERE file_id=?", (fid,), True): raise HTTPException(403)
+    else: access(f["case_id"], u)
+    return FileResponse((f["raw"] if raw and f["raw"] else f["path"]), filename=f["name"] if f["kind"] == "doc" else None)
 
 @app.post("/api/cases/{cid}/refer")
 def refer(cid: int, r: Refer, u=Depends(user)):
@@ -188,7 +237,7 @@ def refer(cid: int, r: Refer, u=Depends(user)):
     if c["lab_id"] != u["lab_id"]: raise HTTPException(403)
     if not q("SELECT 1 FROM labs WHERE id=? AND has_expert=1", (r.to_lab,), True): raise HTTPException(400, "Établissement sans expert")
     q("INSERT INTO referrals(case_id,from_lab,to_lab,sent_by,message,status,sent_at) VALUES(?,?,?,?,?,?,?)", (cid, u["lab_id"], r.to_lab, u["id"], r.message, "en_attente", time.time()))
-    q("UPDATE cases SET status='envoyé pour expertise' WHERE id=?", (cid,)); return {"ok": True}
+    q("UPDATE cases SET status='envoyé pour expertise' WHERE id=?", (cid,)); audit(u, "refer", f"case {cid} -> lab {r.to_lab}"); return {"ok": True}
 
 @app.post("/api/referrals/{rid}/report")
 def report(rid: int, r: Report, u=Depends(user)):
@@ -198,7 +247,7 @@ def report(rid: int, r: Report, u=Depends(user)):
         if f.get("status") in ("confirmed", "rejected"):
             q("UPDATE findings SET status=?,confirmed_by=?,confirmed_at=? WHERE id=? AND case_id=?", (f["status"], u["id"], time.time(), f["id"], ref["case_id"]))
     q("UPDATE referrals SET status='expertisé',verdict=?,report=?,expert_id=?,reviewed_at=? WHERE id=?", (r.verdict, r.report, u["id"], time.time(), rid))
-    q("UPDATE cases SET status='expertisé' WHERE id=?", (ref["case_id"],)); return {"ok": True}
+    q("UPDATE cases SET status='expertisé' WHERE id=?", (ref["case_id"],)); audit(u, "expert_report", f"case {ref['case_id']}"); return {"ok": True}
 
 @app.get("/api/classes")
 def classes(u=Depends(user)): return {"model": LABELS, "extra": EXTRA, "other": OTHER}
@@ -213,12 +262,17 @@ def _file(fid, u):
 
 @app.get("/api/files/{fid}/annotations")
 def get_ann(fid: int, u=Depends(user)):
-    _file(fid, u); return q("SELECT label,x0,y0,x1,y1 FROM annotations WHERE file_id=?", (fid,))
+    if u["role"] == "central": return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=?", (fid,))
+    _file(fid, u); return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=?", (fid,))
+
+def _rm(p):
+    try: os.remove(p)
+    except FileNotFoundError: pass
 
 @app.post("/api/files/{fid}/annotations")
 def save_ann(fid: int, a: AnnIn, u=Depends(user)):
-    """Enregistre l'annotation de l'expert et l'ajoute au dossier dataset (format YOLO) pour un futur réentraînement."""
-    if u["role"] not in ("expert", "admin"): raise HTTPException(403, "Réservé à l'expert")
+    """Enregistre l'annotation de l'expert : elle reste EN ATTENTE (dossier dataset_pending) jusqu'à validation par l'administration centrale."""
+    if u["role"] not in ("expert", "admin") or not u["has_expert"]: raise HTTPException(403, "Réservé à l'expert")
     f = _file(fid, u); img = cv2.imread(f["raw"] or f["path"])
     if img is None: raise HTTPException(400, "Image illisible")
     q("DELETE FROM annotations WHERE file_id=?", (fid,)); lines = []
@@ -227,62 +281,148 @@ def save_ann(fid: int, a: AnnIn, u=Depends(user)):
         x0, y0, x1, y1 = [min(max(v, 0.0), 1.0) for v in b.box]; x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
         if x1 - x0 < .005 or y1 - y0 < .005: continue
         lines.append(f"{CLASSES.index(b.label)} {(x0+x1)/2:.6f} {(y0+y1)/2:.6f} {x1-x0:.6f} {y1-y0:.6f}")
-        q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created) VALUES(?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, x0, y0, x1, y1, u["id"], time.time()))
-    cv2.imwrite(f"{DS}/images/dap_{fid}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    open(f"{DS}/labels/dap_{fid}.txt", "w").write("\n".join(lines))
-    return {"saved": len(lines)}
+        q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created,review) VALUES(?,?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, x0, y0, x1, y1, u["id"], time.time(), "pending"))
+    _rm(f"{DS}/images/dap_{fid}.jpg"); _rm(f"{DS}/labels/dap_{fid}.txt")   # toute modification annule une validation antérieure
+    cv2.imwrite(f"{PD}/images/dap_{fid}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    open(f"{PD}/labels/dap_{fid}.txt", "w").write("\n".join(lines))
+    audit(u, "annotate", f"file {fid}"); return {"saved": len(lines), "review": "pending"}
+
+# ---------- Administration centrale ----------
+@app.get("/api/central/overview")
+def c_overview(u=Depends(central)):
+    n = lambda sql: q(sql, (), True)["n"]
+    return {"labs_pending": n("SELECT COUNT(*) n FROM labs WHERE status='pending'"), "labs_approved": n("SELECT COUNT(*) n FROM labs WHERE status='approved' AND type!='Central'"),
+            "ann_pending": n("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='pending'"), "ann_approved": n("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='approved'"),
+            "cases": n("SELECT COUNT(*) n FROM cases"), "confirmed": n("SELECT COUNT(*) n FROM findings WHERE status='confirmed'"),
+            "by_parasite": q("SELECT parasite,COUNT(*) n FROM findings WHERE status='confirmed' GROUP BY parasite ORDER BY n DESC")}
+
+@app.get("/api/central/labs")
+def c_labs(u=Depends(central)):
+    return q("SELECT l.id,l.name,l.type,l.wilaya,l.address,l.phone,l.has_expert,l.status,l.created,(SELECT email FROM users WHERE lab_id=l.id AND role='admin' LIMIT 1) admin_email FROM labs l WHERE l.type!='Central' ORDER BY (l.status='pending') DESC, l.id DESC")
+
+class Review(BaseModel): action: str
+
+@app.post("/api/central/labs/{lid}/review")
+def c_lab_review(lid: int, r: Review, u=Depends(central)):
+    st = {"approve": "approved", "reject": "rejected", "suspend": "rejected"}.get(r.action)
+    if not st: raise HTTPException(400)
+    q("UPDATE labs SET status=? WHERE id=? AND type!='Central'", (st, lid)); audit(u, "lab_" + r.action, lid); return {"ok": True}
+
+@app.get("/api/central/annotations")
+def c_ann(review: str = "pending", u=Depends(central)):
+    return q("""SELECT a.file_id,a.review,COUNT(*) boxes,GROUP_CONCAT(DISTINCT a.label) labels,l.name lab,e.name expert,MAX(a.created) created
+      FROM annotations a JOIN cases c ON c.id=a.case_id JOIN labs l ON l.id=c.lab_id LEFT JOIN users e ON e.id=a.expert_id
+      WHERE a.review=? GROUP BY a.file_id ORDER BY created DESC LIMIT 300""", (review,))
+
+@app.post("/api/central/files/{fid}/review")
+def c_file_review(fid: int, r: Review, u=Depends(central)):
+    if r.action not in ("approve", "reject"): raise HTTPException(400)
+    new = "approved" if r.action == "approve" else "rejected"
+    if not q("SELECT 1 FROM annotations WHERE file_id=?", (fid,), True): raise HTTPException(404)
+    q("UPDATE annotations SET review=?,reviewed_by=?,reviewed_at=? WHERE file_id=?", (new, u["id"], time.time(), fid))
+    pi, pl = f"{PD}/images/dap_{fid}.jpg", f"{PD}/labels/dap_{fid}.txt"
+    if new == "approved" and os.path.exists(pi):
+        shutil.copy(pi, f"{DS}/images/dap_{fid}.jpg"); shutil.copy(pl, f"{DS}/labels/dap_{fid}.txt")
+    else: _rm(f"{DS}/images/dap_{fid}.jpg"); _rm(f"{DS}/labels/dap_{fid}.txt")
+    audit(u, "annotation_" + r.action, f"file {fid}"); return {"ok": True}
+
+@app.get("/api/central/audit")
+def c_audit(u=Depends(central)):
+    return q("SELECT a.ts,a.action,a.target,u.name,u.email,l.name lab FROM audit a LEFT JOIN users u ON u.id=a.user_id LEFT JOIN labs l ON l.id=a.lab_id ORDER BY a.id DESC LIMIT 300")
 
 @app.get("/api/dataset/stats")
-def ds_stats(u=Depends(user)):
-    return {"images": q("SELECT COUNT(DISTINCT file_id) n FROM annotations", (), True)["n"], "boxes": q("SELECT COUNT(*) n FROM annotations", (), True)["n"],
-            "by_class": q("SELECT label,COUNT(*) n FROM annotations GROUP BY label ORDER BY n DESC")}
+def ds_stats(u=Depends(central)):
+    return {"images": q("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='approved'", (), True)["n"], "boxes": q("SELECT COUNT(*) n FROM annotations WHERE review='approved'", (), True)["n"],
+            "pending": q("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='pending'", (), True)["n"],
+            "by_class": q("SELECT label,COUNT(*) n FROM annotations WHERE review='approved' GROUP BY label ORDER BY n DESC")}
 
 @app.get("/api/dataset.zip")
-def ds_zip(u=Depends(user)):
-    if u["role"] not in ("expert", "admin"): raise HTTPException(403)
+def ds_zip(u=Depends(central)):
     open(DS + "/data.yaml", "w").write("path: .\ntrain: images\nval: images  # à séparer en train/val avant l'entraînement\nnames:\n" + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES)))
-    return FileResponse(shutil.make_archive(DATA + "/dap_dataset", "zip", DS), filename="dap_dataset_yolo.zip")
+    audit(u, "dataset_export"); return FileResponse(shutil.make_archive(DATA + "/dap_dataset", "zip", DS), filename="dap_dataset_yolo.zip")
+
+_F = {}
+def _fonts():
+    if _F: return
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    pdfmetrics.registerFont(TTFont("DJ", BASE + "/fonts/DejaVuSans.ttf")); pdfmetrics.registerFont(TTFont("DJB", BASE + "/fonts/DejaVuSans-Bold.ttf")); _F["ok"] = 1
+
+def T(t):
+    """Texte pour PDF : met en forme l'arabe (lettres liées + sens droite-gauche), échappe le XML."""
+    from xml.sax.saxutils import escape as X
+    t = str(t or "")
+    if any("\u0600" <= ch <= "\u06ff" for ch in t):
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        t = "\n".join(get_display(arabic_reshaper.reshape(l)) for l in t.split("\n"))
+    return X(t).replace("\n", "<br/>")
 
 @app.get("/api/cases/{cid}/report.pdf")
 def report_pdf(cid: int, u=Depends(user)):
+    """Compte rendu d'examen parasitologique des selles, mise en page type compte rendu de laboratoire algérien (bilingue FR/AR)."""
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib import colors
     from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RI
-    from xml.sax.saxutils import escape as X
-    c = access(cid, u); lab = q("SELECT * FROM labs WHERE id=?", (c["lab_id"],), True); st = getSampleStyleSheet(); N = st["Normal"]
-    S = [Paragraph("Rapport DAP - Diagnostic Automatique des Parasites", st["Title"]),
-         Paragraph(f"Établissement : <b>{X(lab['name'])}</b> {X(lab['wilaya'] or '')}<br/>Dossier n° {cid} - Patient : <b>{X(c['patient_ref'])}</b> - Âge : {X(str(c['age']))} - Sexe : {X(c['sex'])}<br/>Prélèvement : {X(c['sample_type'])} - Date : {time.strftime('%d/%m/%Y %H:%M', time.localtime(c['created']))}", N), Spacer(1, 10)]
-    if c["notes"]: S += [Paragraph("Notes cliniques : " + X(c["notes"]), N), Spacer(1, 8)]
-    lbl = {"auto": "IA (non confirmé)", "confirmed": "Confirmé par l'expert", "rejected": "Infirmé par l'expert"}
-    fs = q("SELECT parasite,conf,status FROM findings WHERE case_id=? ORDER BY status,conf DESC", (cid,))
-    S.append(Paragraph("Détections", st["Heading2"]))
-    rows = [["Parasite", "Confiance", "Statut"]] + [[x["parasite"], f"{x['conf']*100:.0f}%", lbl[x["status"]]] for x in fs]
-    t = Table(rows if fs else [["Parasite", "Confiance", "Statut"], ["Aucune détection", "", ""]], colWidths=[7*cm, 3*cm, 6*cm])
-    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f766e")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("FONTSIZE", (0, 0), (-1, -1), 9)]))
-    S += [t, Spacer(1, 10)]
-    an = q("SELECT label,COUNT(*) n FROM annotations WHERE case_id=? GROUP BY label", (cid,))
-    if an: S += [Paragraph("Annotations de l'expert : " + X(", ".join(f"{a['label']} (x{a['n']})" for a in an)), N), Spacer(1, 8)]
-    for r in q("SELECT r.*,b.name to_name FROM referrals r JOIN labs b ON b.id=r.to_lab WHERE case_id=? AND r.status='expertisé'", (cid,)):
-        S += [Paragraph("Rapport d'expertise - " + X(r["to_name"]), st["Heading2"]), Paragraph("<b>Conclusion :</b> " + X(r["verdict"] or ""), N), Paragraph(X(r["report"] or "").replace("\n", "<br/>"), N), Spacer(1, 8)]
-    for f in q("SELECT path FROM files WHERE case_id=? AND kind='annotée' LIMIT 6", (cid,)):
-        im = cv2.imread(f["path"])
-        if im is not None:
-            h, w = im.shape[:2]; k = min(14*cm / w, 9*cm / h); S += [RI(f["path"], width=w*k, height=h*k), Spacer(1, 6)]
-    S += [Spacer(1, 10), Paragraph("<i>Les résultats de l'IA sont une aide au diagnostic et doivent être validés par un expert qualifié.</i>", N)]
-    buf = io.BytesIO(); SimpleDocTemplate(buf, pagesize=A4, title=f"Rapport DAP {cid}").build(S)
-    return Response(buf.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="rapport_dap_{cid}.pdf"'})
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RI, KeepTogether
+    _fonts(); c = access(cid, u); audit(u, "report_pdf", cid)
+    lab = q("SELECT * FROM labs WHERE id=?", (c["lab_id"],), True)
+    P = lambda size=9, bold=False, **k: ParagraphStyle("p", fontName="DJB" if bold else "DJ", fontSize=size, leading=size * 1.4, **k)
+    N, B = P(9), P(9, True)
+    exp = q("SELECT r.*,b.name to_name,b.wilaya to_wilaya,e.name expert_name FROM referrals r JOIN labs b ON b.id=r.to_lab LEFT JOIN users e ON e.id=r.expert_id WHERE r.case_id=? AND r.status='expertisé' ORDER BY r.id DESC LIMIT 1", (cid,), True)
+    fs = q("SELECT parasite,conf,status FROM findings WHERE case_id=? AND status!='rejected' ORDER BY status,conf DESC", (cid,))
+    fmt = lambda t: time.strftime("%d/%m/%Y", time.localtime(t))
+    S = []
+    head = Table([[Paragraph("République Algérienne Démocratique et Populaire<br/>Ministère de la Santé", P(8.5, True, alignment=0)),
+                   Paragraph(T("الجمهورية الجزائرية الديمقراطية الشعبية") + "<br/>" + T("وزارة الصحة"), P(9.5, True, alignment=TA_RIGHT))]], colWidths=[9*cm, 8*cm])
+    head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")])); S += [head, Spacer(1, 6)]
+    S += [Paragraph(T(lab["name"]) + (" - " + T(lab["wilaya"]) if lab["wilaya"] else ""), P(12, True, alignment=TA_CENTER)),
+          Paragraph(T(lab["address"] or "") + ((" - Tél : " + T(lab["phone"])) if lab["phone"] else ""), P(8, alignment=TA_CENTER)), Spacer(1, 10)]
+    tt = Table([[Paragraph("COMPTE RENDU D'EXAMEN PARASITOLOGIQUE DES SELLES<br/>" + T("نتيجة الفحص الطفيلي للبراز"), P(11, True, alignment=TA_CENTER, textColor=colors.white))]], colWidths=[17*cm])
+    tt.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0f766e")), ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)])); S += [tt, Spacer(1, 8)]
+    pat = Table([[Paragraph("<b>Nom et prénom / " + T("الاسم واللقب") + " :</b> " + T(c["patient_ref"]), N), Paragraph("<b>N° dossier :</b> %s-%05d" % (lab["id"], cid), N)],
+                 [Paragraph("<b>Âge / " + T("السن") + " :</b> " + T(c["age"] or "-") + " &nbsp;&nbsp; <b>Sexe / " + T("الجنس") + " :</b> " + T(c["sex"] or "-"), N), Paragraph("<b>Date de réception :</b> " + fmt(c["created"]), N)],
+                 [Paragraph("<b>Nature du prélèvement :</b> " + T(c["sample_type"]), N), Paragraph("<b>Date du résultat :</b> " + fmt(exp["reviewed_at"] if exp else time.time()), N)]], colWidths=[10.5*cm, 6.5*cm])
+    pat.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .6, colors.grey), ("INNERGRID", (0, 0), (-1, -1), .25, colors.lightgrey), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)])); S += [pat, Spacer(1, 8)]
+    if c["notes"]: S += [Paragraph("<b>Renseignements cliniques :</b> " + T(c["notes"]), N), Spacer(1, 6)]
+    lbl = {"auto": "Détection IA (à valider)", "confirmed": "Confirmé par l'expert"}
+    S += [Paragraph("EXAMEN MICROSCOPIQUE DIRECT / " + T("الفحص المجهري المباشر"), P(10, True)), Spacer(1, 3)]
+    rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut"]] + [[Paragraph(T(x["parasite"]), N), "%d %%" % round(x["conf"] * 100), lbl.get(x["status"], x["status"])] for x in fs]
+    if not fs: rows.append([Paragraph("Absence d'élément parasitaire détecté sur les images analysées / " + T("لم يتم الكشف عن أي طفيلي"), N), "", ""])
+    tb = Table(rows, colWidths=[9*cm, 3*cm, 5*cm], repeatRows=1)
+    tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), "DJ"), ("FONTNAME", (0, 0), (-1, 0), "DJB"), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2f3f1")), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); S += [tb, Spacer(1, 8)]
+    S += [Paragraph("CONCLUSION / " + T("الخلاصة"), P(10, True)), Spacer(1, 3)]
+    if exp: S += [Paragraph(T(exp["verdict"] or ""), B), Paragraph(T(exp["report"] or ""), N)]
+    else: S += [Paragraph("Résultat PRÉLIMINAIRE établi par intelligence artificielle, non encore validé par un médecin expert. Ne pas utiliser seul pour une décision thérapeutique.", B)]
+    S.append(Spacer(1, 8))
+    imgs = [f["path"] for f in q("SELECT path FROM files WHERE case_id=? AND kind='annotée' LIMIT 4", (cid,)) if f["path"] and os.path.exists(f["path"])]
+    cells = []
+    for p in imgs:
+        im = cv2.imread(p)
+        if im is not None: h, w = im.shape[:2]; k = min(8*cm / w, 6*cm / h); cells.append(RI(p, width=w * k, height=h * k))
+    if cells:
+        S.append(Paragraph("Images analysées / " + T("الصور المحللة"), P(9, True))); S.append(Spacer(1, 3))
+        g = Table([cells[i:i + 2] + [""] * (2 - len(cells[i:i + 2])) for i in range(0, len(cells), 2)], colWidths=[8.5*cm, 8.5*cm]); S += [g, Spacer(1, 8)]
+    sig = Table([[Paragraph("Le technicien / Le biologiste<br/>" + T("التقني / البيولوجي"), P(8.5, True, alignment=TA_CENTER)),
+                  Paragraph("Le médecin expert<br/>" + T("الطبيب الخبير") + ((" : " + T(exp["expert_name"] or "") + "<br/>" + T(exp["to_name"])) if exp else ""), P(8.5, True, alignment=TA_CENTER)),
+                  Paragraph("Cachet<br/>" + T("الختم"), P(8.5, True, alignment=TA_CENTER))], ["", "", ""]], colWidths=[5.6*cm] * 3, rowHeights=[1.9*cm, 2.2*cm])
+    sig.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .5, colors.grey), ("INNERGRID", (0, 0), (-1, -1), .25, colors.lightgrey), ("VALIGN", (0, 0), (-1, 0), "MIDDLE")]))
+    S += [KeepTogether([sig, Spacer(1, 6), Paragraph("Document généré par la plateforme DAP. Les détections par IA constituent une aide au diagnostic et doivent être validées par un professionnel de santé qualifié.", P(7, alignment=TA_CENTER, textColor=colors.grey))])]
+    buf = io.BytesIO(); SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=1.5*cm, bottomMargin=1.5*cm, title=f"Compte rendu {lab['id']}-{cid}").build(S)
+    return Response(buf.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="compte_rendu_{cid}.pdf"'})
 
 @app.get("/api/database")
-def database(status: str = "confirmed", parasite: str = "", u=Depends(user)):
-    """Base des parasites : confirmés de tout le réseau (sans identité patient) + propres résultats du labo."""
-    rows = q("""SELECT f.id,f.parasite,f.conf,f.status,f.file_id,f.confirmed_at,c.id case_id,l.name lab,c.age,c.sex,c.created,
-      CASE WHEN c.lab_id=? THEN c.patient_ref ELSE NULL END patient_ref, e.name expert
+def database(status: str = "all", parasite: str = "", u=Depends(user)):
+    """Base des parasites. Établissements : uniquement leurs propres résultats. Administration centrale : toutes les détections confirmées, sans identité patient."""
+    if u["role"] == "central":
+        return q("""SELECT f.id,f.parasite,f.conf,f.status,f.file_id,f.confirmed_at,c.id case_id,l.name lab,c.age,c.sex,c.created,NULL patient_ref,e.name expert
+          FROM findings f JOIN cases c ON c.id=f.case_id JOIN labs l ON l.id=c.lab_id LEFT JOIN users e ON e.id=f.confirmed_by
+          WHERE f.status='confirmed' AND (?='' OR f.parasite=?) ORDER BY f.id DESC LIMIT 500""", (parasite, parasite))
+    return q("""SELECT f.id,f.parasite,f.conf,f.status,f.file_id,f.confirmed_at,c.id case_id,l.name lab,c.age,c.sex,c.created,c.patient_ref,e.name expert
       FROM findings f JOIN cases c ON c.id=f.case_id JOIN labs l ON l.id=c.lab_id LEFT JOIN users e ON e.id=f.confirmed_by
-      WHERE (?='all' OR f.status=?) AND (?='' OR f.parasite=?) AND (f.status='confirmed' OR c.lab_id=?) ORDER BY f.id DESC LIMIT 500""",
-      (u["lab_id"], status, status, parasite, parasite, u["lab_id"]))
-    return rows
+      WHERE c.lab_id=? AND (?='all' OR f.status=?) AND (?='' OR f.parasite=?) ORDER BY f.id DESC LIMIT 500""", (u["lab_id"], status, status, parasite, parasite))
 
 @app.get("/api/stats")
 def stats(u=Depends(user)):
@@ -291,6 +431,6 @@ def stats(u=Depends(user)):
             "pending_out": q("SELECT COUNT(*) n FROM referrals WHERE from_lab=? AND status='en_attente'", (l,), True)["n"],
             "inbox": q("SELECT COUNT(*) n FROM referrals WHERE to_lab=? AND status='en_attente'", (l,), True)["n"],
             "confirmed": q("SELECT COUNT(*) n FROM findings f JOIN cases c ON c.id=f.case_id WHERE c.lab_id=? AND f.status='confirmed'", (l,), True)["n"],
-            "by_parasite": q("SELECT parasite,COUNT(*) n FROM findings WHERE status='confirmed' GROUP BY parasite ORDER BY n DESC")}
+            "by_parasite": q("SELECT f.parasite,COUNT(*) n FROM findings f JOIN cases c ON c.id=f.case_id WHERE c.lab_id=? AND f.status!='rejected' GROUP BY f.parasite ORDER BY n DESC", (l,))}
 
 if os.path.isdir(BASE + "/static"): app.mount("/", StaticFiles(directory=BASE + "/static", html=True))
