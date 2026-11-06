@@ -183,7 +183,7 @@ def cases(u=Depends(user)):
 @app.get("/api/cases/{cid}")
 def case(cid: int, u=Depends(user)):
     c = access(cid, u); own = c["lab_id"] == u["lab_id"]; audit(u, "view_case", cid)
-    refs = q("SELECT r.*,a.name from_name,b.name to_name FROM referrals r JOIN labs a ON a.id=r.from_lab JOIN labs b ON b.id=r.to_lab WHERE case_id=? ORDER BY r.id DESC", (cid,))
+    refs = q("SELECT r.*,a.name from_name,b.name to_name,(SELECT name FROM users WHERE id=r.expert_id) expert_name FROM referrals r JOIN labs a ON a.id=r.from_lab JOIN labs b ON b.id=r.to_lab WHERE case_id=? ORDER BY r.id DESC", (cid,))
     can_review = any(r["to_lab"] == u["lab_id"] and r["status"] == "en_attente" for r in refs) and u["role"] in ("expert", "admin")
     return {"case": c, "own": own, "files": q("SELECT id,name,kind,parent FROM files WHERE case_id=?", (cid,)),
             "findings": q("SELECT id,file_id,parasite,conf,status,box FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review}
@@ -243,6 +243,7 @@ def refer(cid: int, r: Refer, u=Depends(user)):
 def report(rid: int, r: Report, u=Depends(user)):
     ref = q("SELECT * FROM referrals WHERE id=?", (rid,), True)
     if not ref or ref["to_lab"] != u["lab_id"] or u["role"] not in ("expert", "admin") or ref["status"] != "en_attente": raise HTTPException(403)
+    if not (r.verdict or "").strip(): raise HTTPException(400, "Conclusion obligatoire avant l'envoi du rapport")
     for f in r.findings:
         if f.get("status") in ("confirmed", "rejected"):
             q("UPDATE findings SET status=?,confirmed_by=?,confirmed_at=? WHERE id=? AND case_id=?", (f["status"], u["id"], time.time(), f["id"], ref["case_id"]))
