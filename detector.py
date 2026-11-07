@@ -35,11 +35,16 @@ class Detector:
             res.append({"parasite": LABELS[int(cid[j])], "class_id": int(cid[j]), "conf": round(float(cf[j]), 3), "box": bx})
         return res
 
+def _lbl(d):
+    import unicodedata
+    n = unicodedata.normalize("NFKD", d["parasite"]).encode("ascii", "ignore").decode()   # cv2.putText ne sait pas afficher les accents
+    return n if d.get("conf") is None else f'{n} {d["conf"]:.2f}'
+
 def draw(img, dets):
     out = img.copy(); t = max(2, img.shape[1] // 400)
     for d in dets:
         x0, y0, x1, y1 = map(int, d["box"]); k = d["class_id"]
         col = ((k*47) % 200 + 40, (k*91) % 200 + 40, (k*131) % 200 + 40)
         cv2.rectangle(out, (x0, y0), (x1, y1), col, t)
-        cv2.putText(out, f'{d["parasite"]} {d["conf"]:.2f}', (x0, max(15, y0-5)), cv2.FONT_HERSHEY_SIMPLEX, max(.5, t/4), col, t)
+        cv2.putText(out, _lbl(d), (x0, max(15, y0-5)), cv2.FONT_HERSHEY_SIMPLEX, max(.5, t/4), col, t)
     return out
