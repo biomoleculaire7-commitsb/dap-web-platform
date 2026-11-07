@@ -229,7 +229,7 @@ def get_file(fid: int, raw: int = Query(0), u=Depends(user)):
     if u["role"] == "central":
         if not q("SELECT 1 FROM annotations WHERE file_id=?", (fid,), True): raise HTTPException(403)
     else: access(f["case_id"], u)
-    return FileResponse((f["raw"] if raw and f["raw"] else f["path"]), filename=f["name"] if f["kind"] == "doc" else None)
+    return FileResponse((f["raw"] if raw and f["raw"] else f["path"]), filename=f["name"] if f["kind"] == "doc" else None, headers={"Cache-Control": "no-cache"})
 
 @app.post("/api/cases/{cid}/refer")
 def refer(cid: int, r: Refer, u=Depends(user)):
@@ -276,16 +276,22 @@ def save_ann(fid: int, a: AnnIn, u=Depends(user)):
     if u["role"] not in ("expert", "admin") or not u["has_expert"]: raise HTTPException(403, "Réservé à l'expert")
     f = _file(fid, u); img = cv2.imread(f["raw"] or f["path"])
     if img is None: raise HTTPException(400, "Image illisible")
-    q("DELETE FROM annotations WHERE file_id=?", (fid,)); lines = []
+    q("DELETE FROM annotations WHERE file_id=?", (fid,)); lines = []; dets = []
+    q("DELETE FROM findings WHERE file_id=?", (fid,))   # le résultat de l'expert remplace les détections de l'IA pour cette image
+    IH, IW = img.shape[:2]
     for b in a.boxes:
         if b.label not in CLASSES: raise HTTPException(400, "Classe inconnue : " + b.label)
         x0, y0, x1, y1 = [min(max(v, 0.0), 1.0) for v in b.box]; x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
         if x1 - x0 < .005 or y1 - y0 < .005: continue
+        dets.append({"parasite": b.label, "class_id": CLASSES.index(b.label), "conf": None, "box": [x0 * IW, y0 * IH, x1 * IW, y1 * IH]})
+        if b.label not in OTHER:   # artéfacts / levures / débris : gardés pour l'entraînement, pas comptés comme parasites
+            q("INSERT INTO findings(case_id,file_id,parasite,conf,box,status,confirmed_by,confirmed_at) VALUES(?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, None, json.dumps([x0 * IW, y0 * IH, x1 * IW, y1 * IH]), "confirmed", u["id"], time.time()))
         lines.append(f"{CLASSES.index(b.label)} {(x0+x1)/2:.6f} {(y0+y1)/2:.6f} {x1-x0:.6f} {y1-y0:.6f}")
         q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created,review) VALUES(?,?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, x0, y0, x1, y1, u["id"], time.time(), "pending"))
     _rm(f"{DS}/images/dap_{fid}.jpg"); _rm(f"{DS}/labels/dap_{fid}.txt")   # toute modification annule une validation antérieure
     cv2.imwrite(f"{PD}/images/dap_{fid}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     open(f"{PD}/labels/dap_{fid}.txt", "w").write("\n".join(lines))
+    if f["kind"] == "annotée" and f["path"]: cv2.imwrite(f["path"], draw(img, dets))   # l'image vue par le laboratoire montre les boîtes de l'expert
     audit(u, "annotate", f"file {fid}"); return {"saved": len(lines), "review": "pending"}
 
 # ---------- Administration centrale ----------
@@ -408,12 +414,16 @@ def _report_pdf(cid, u):
                  [Paragraph("<b>Nature du prélèvement :</b> " + T(c["sample_type"]), N), Paragraph("<b>Date du résultat :</b> " + fmt(exp["reviewed_at"] if exp else time.time()), N)]], colWidths=[10.5*cm, 6.5*cm])
     pat.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .6, colors.grey), ("INNERGRID", (0, 0), (-1, -1), .25, colors.lightgrey), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)])); S += [pat, Spacer(1, 8)]
     if c["notes"]: S += [Paragraph("<b>Renseignements cliniques :</b> " + T(c["notes"]), N), Spacer(1, 6)]
-    lbl = {"auto": "Détection IA (à valider)", "confirmed": "Confirmé par l'expert"}
+    lbl = {"auto": "Détection IA (à valider)", "confirmed": "Confirmé / identifié par l'expert"}
     S += [Paragraph("EXAMEN MICROSCOPIQUE DIRECT / " + T("الفحص المجهري المباشر"), P(10, True)), Spacer(1, 3)]
-    rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut"]] + [[Paragraph(T(x["parasite"]), N), "%d %%" % round(x["conf"] * 100), lbl.get(x["status"], x["status"])] for x in fs]
+    rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut"]] + [[Paragraph(T(x["parasite"]), N), ("-" if x["conf"] is None else "%d %%" % round(x["conf"] * 100)), lbl.get(x["status"], x["status"])] for x in fs]
     if not fs: rows.append([Paragraph("Absence d'élément parasitaire détecté sur les images analysées / " + T("لم يتم الكشف عن أي طفيلي"), N), "", ""])
     tb = Table(rows, colWidths=[9*cm, 3*cm, 5*cm], repeatRows=1)
     tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _F["n"]), ("FONTNAME", (0, 0), (-1, 0), _F["b"]), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2f3f1")), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); S += [tb, Spacer(1, 8)]
+    conf_names = {}
+    for x in fs:
+        if x["status"] == "confirmed": conf_names[x["parasite"]] = conf_names.get(x["parasite"], 0) + 1
+    if conf_names: S += [Paragraph("<b>Éléments parasitaires confirmés par l'expert :</b> " + T(", ".join(f"{k} (x{v})" for k, v in conf_names.items())), N), Spacer(1, 6)]
     S += [Paragraph("CONCLUSION / " + T("الخلاصة"), P(10, True)), Spacer(1, 3)]
     if exp: S += [Paragraph(T(exp["verdict"] or ""), B), Paragraph(T(exp["report"] or ""), N)]
     else: S += [Paragraph("Résultat PRÉLIMINAIRE établi par intelligence artificielle, non encore validé par un médecin expert. Ne pas utiliser seul pour une décision thérapeutique.", B)]
