@@ -349,10 +349,41 @@ def ds_stats(u=Depends(central)):
             "pending": q("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='pending'", (), True)["n"],
             "by_class": q("SELECT label,COUNT(*) n FROM annotations WHERE review='approved' GROUP BY label ORDER BY n DESC")}
 
+def _ds_rows(review="all", parasite=""):
+    """Une ligne par IMAGE annotée (train + label YOLO), avec établissement source et nom de l'expert."""
+    rows = q("""SELECT a.file_id,a.review,a.label,a.x0,a.y0,a.x1,a.y1,a.created,l.name lab,e.name expert,c.id case_id
+      FROM annotations a JOIN cases c ON c.id=a.case_id JOIN labs l ON l.id=c.lab_id LEFT JOIN users e ON e.id=a.expert_id
+      WHERE (?='all' OR a.review=?) ORDER BY a.file_id DESC, a.id""", (review, review))
+    out = {}
+    for r in rows:
+        o = out.setdefault(r["file_id"], {"file_id": r["file_id"], "case_id": r["case_id"], "review": r["review"], "lab": r["lab"], "expert": r["expert"], "created": r["created"], "labels": {}, "yolo": []})
+        o["labels"][r["label"]] = o["labels"].get(r["label"], 0) + 1
+        o["created"] = max(o["created"] or 0, r["created"] or 0)
+        o["yolo"].append(f"{CLASSES.index(r['label'])} {(r['x0']+r['x1'])/2:.6f} {(r['y0']+r['y1'])/2:.6f} {r['x1']-r['x0']:.6f} {r['y1']-r['y0']:.6f}")
+    res = [dict(o, yolo="\n".join(o["yolo"])) for o in out.values() if not parasite or parasite.lower() in " ".join(o["labels"]).lower()]
+    return sorted(res, key=lambda o: o["created"] or 0, reverse=True)
+
+@app.get("/api/central/dataset")
+def c_dataset(review: str = "all", parasite: str = "", u=Depends(central)):
+    if review not in ("all", "pending", "approved", "rejected"): raise HTTPException(400)
+    return _ds_rows(review, parasite)[:300]
+
 @app.get("/api/dataset.zip")
 def ds_zip(u=Depends(central)):
-    open(DS + "/data.yaml", "w").write("path: .\ntrain: images\nval: images  # à séparer en train/val avant l'entraînement\nnames:\n" + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES)))
-    audit(u, "dataset_export"); return FileResponse(shutil.make_archive(DATA + "/dap_dataset", "zip", DS), filename="dap_dataset_yolo.zip")
+    """Export YOLO : train/images, train/labels, val/images, val/labels, data.yaml, sources.csv (établissement source + expert)."""
+    import csv, tempfile
+    tmp = tempfile.mkdtemp(); rows = [o for o in _ds_rows("approved") if os.path.exists(f"{DS}/images/dap_{o['file_id']}.jpg")]
+    for sp in ("train", "val"): os.makedirs(f"{tmp}/{sp}/images"); os.makedirs(f"{tmp}/{sp}/labels")
+    with open(tmp + "/sources.csv", "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh); w.writerow(["split", "image", "label", "etablissement_source", "expert", "parasites"])
+        for o in rows:
+            fid = o["file_id"]; sp = "val" if fid % 7 == 0 else "train"
+            shutil.copy(f"{DS}/images/dap_{fid}.jpg", f"{tmp}/{sp}/images/dap_{fid}.jpg"); shutil.copy(f"{DS}/labels/dap_{fid}.txt", f"{tmp}/{sp}/labels/dap_{fid}.txt")
+            w.writerow([sp, f"{sp}/images/dap_{fid}.jpg", f"{sp}/labels/dap_{fid}.txt", o["lab"], o["expert"] or "", "; ".join(f"{k} x{n}" for k, n in o["labels"].items())])
+    has_val = any(os.listdir(f"{tmp}/val/images"))
+    open(tmp + "/data.yaml", "w").write("path: .\ntrain: train/images\nval: " + ("val/images" if has_val else "train/images") + "\nnames:\n" + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES)))
+    arc = shutil.make_archive(DATA + "/dap_dataset", "zip", tmp); shutil.rmtree(tmp, ignore_errors=True)
+    audit(u, "dataset_export"); return FileResponse(arc, filename="dap_dataset_yolo.zip")
 
 _F = {}
 def _fonts():
