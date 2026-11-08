@@ -44,12 +44,15 @@ q("CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY, case_id INT, f
 for m in ["ALTER TABLE labs ADD COLUMN status", "ALTER TABLE sessions ADD COLUMN created REAL", "ALTER TABLE annotations ADD COLUMN review", "ALTER TABLE annotations ADD COLUMN reviewed_by INT", "ALTER TABLE annotations ADD COLUMN reviewed_at REAL"]:
     try: q(m)
     except Exception: pass
+q("CREATE TABLE IF NOT EXISTS ai_files(file_id INTEGER PRIMARY KEY, n INT, ts REAL)")   # image analysée par l'IA (même si 0 détection)
+q("CREATE TABLE IF NOT EXISTS ai_preds(id INTEGER PRIMARY KEY, file_id INT, parasite, conf REAL, x0 REAL, y0 REAL, x1 REAL, y1 REAL)")   # prédictions ORIGINALES du modèle (coordonnées normalisées)
 q("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, user_id INT, lab_id INT, action, target, ts REAL)")
 q("UPDATE labs SET status='approved' WHERE status IS NULL")
 q("UPDATE annotations SET review='pending' WHERE review IS NULL")
 
 try: q("ALTER TABLE files ADD COLUMN raw")
 except Exception: pass
+NEG = "__NEG__"   # marqueur interne : image validée par l'expert « sans parasite » (échantillon négatif)
 DS = DATA + "/dataset"; os.makedirs(DS + "/images", exist_ok=True); os.makedirs(DS + "/labels", exist_ok=True)   # dataset APPROUVÉ (seul exportable)
 PD = DATA + "/dataset_pending"; os.makedirs(PD + "/images", exist_ok=True); os.makedirs(PD + "/labels", exist_ok=True)  # en attente de validation centrale
 # LISTE MAÎTRESSE (ajout en fin de liste uniquement : les index 0-18 = modèle actuel ; ne jamais réordonner)
@@ -210,6 +213,12 @@ async def upload(cid: int, files: List[UploadFile] = File(default=[]), u=Depends
     q("UPDATE cases SET status=? WHERE id=? AND status IN ('nouveau','analysé')", ("analysé", cid))
     return {"results": out}
 
+def _snap_ai(fid, dets, IW, IH):
+    """Mémorise les prédictions d'origine du modèle (pour mesurer plus tard la concordance IA / expert)."""
+    if q("SELECT 1 FROM ai_files WHERE file_id=?", (fid,), True): return
+    q("INSERT INTO ai_files(file_id,n,ts) VALUES(?,?,?)", (fid, len(dets), time.time()))
+    for lab, conf, b in dets: q("INSERT INTO ai_preds(file_id,parasite,conf,x0,y0,x1,y1) VALUES(?,?,?,?,?,?,?)", (fid, lab, conf, b[0] / IW, b[1] / IH, b[2] / IW, b[3] / IH))
+
 def analyse(cid, parent, img, name, frame=False, raw=None):
     try: d = det()(img)
     except Exception as e: raise HTTPException(500, f"Échec du modèle IA : {type(e).__name__}: {e}")
@@ -220,6 +229,7 @@ def analyse(cid, parent, img, name, frame=False, raw=None):
     if not raw: cv2.imwrite(rp, img)
     q("UPDATE files SET path=?,raw=? WHERE id=?", (p, rp, fid))
     for x in d: q("INSERT INTO findings(case_id,file_id,parasite,conf,box,status) VALUES(?,?,?,?,?,?)", (cid, fid, x["parasite"], x["conf"], json.dumps(x["box"]), "auto"))
+    _snap_ai(fid, [(x["parasite"], x["conf"], x["box"]) for x in d], img.shape[1], img.shape[0])
     return {"name": name, "n": len(d)}
 
 @app.get("/api/files/{fid}")
@@ -263,8 +273,8 @@ def _file(fid, u):
 
 @app.get("/api/files/{fid}/annotations")
 def get_ann(fid: int, u=Depends(user)):
-    if u["role"] == "central": return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=?", (fid,))
-    _file(fid, u); return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=?", (fid,))
+    if u["role"] != "central": _file(fid, u)
+    return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=? AND label!=?", (fid, NEG))
 
 def _rm(p):
     try: os.remove(p)
@@ -276,6 +286,9 @@ def save_ann(fid: int, a: AnnIn, u=Depends(user)):
     if u["role"] not in ("expert", "admin") or not u["has_expert"]: raise HTTPException(403, "Réservé à l'expert")
     f = _file(fid, u); img = cv2.imread(f["raw"] or f["path"])
     if img is None: raise HTTPException(400, "Image illisible")
+    if not q("SELECT 1 FROM ai_files WHERE file_id=?", (fid,), True) and not q("SELECT 1 FROM annotations WHERE file_id=?", (fid,), True):
+        h0, w0 = img.shape[:2]   # image analysée avant la mise en place du suivi : on retient les détections actuelles comme prédictions de l'IA
+        _snap_ai(fid, [(r["parasite"], r["conf"], json.loads(r["box"])) for r in q("SELECT parasite,conf,box FROM findings WHERE file_id=?", (fid,))], w0, h0)
     q("DELETE FROM annotations WHERE file_id=?", (fid,)); lines = []; dets = []
     q("DELETE FROM findings WHERE file_id=?", (fid,))   # le résultat de l'expert remplace les détections de l'IA pour cette image
     IH, IW = img.shape[:2]
@@ -288,11 +301,12 @@ def save_ann(fid: int, a: AnnIn, u=Depends(user)):
             q("INSERT INTO findings(case_id,file_id,parasite,conf,box,status,confirmed_by,confirmed_at) VALUES(?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, None, json.dumps([x0 * IW, y0 * IH, x1 * IW, y1 * IH]), "confirmed", u["id"], time.time()))
         lines.append(f"{CLASSES.index(b.label)} {(x0+x1)/2:.6f} {(y0+y1)/2:.6f} {x1-x0:.6f} {y1-y0:.6f}")
         q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created,review) VALUES(?,?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, x0, y0, x1, y1, u["id"], time.time(), "pending"))
+    if not lines: q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created,review) VALUES(?,?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, NEG, 0, 0, 0, 0, u["id"], time.time(), "pending"))   # échantillon négatif : image sans parasite
     _rm(f"{DS}/images/dap_{fid}.jpg"); _rm(f"{DS}/labels/dap_{fid}.txt")   # toute modification annule une validation antérieure
     cv2.imwrite(f"{PD}/images/dap_{fid}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     open(f"{PD}/labels/dap_{fid}.txt", "w").write("\n".join(lines))
     if f["kind"] == "annotée" and f["path"]: cv2.imwrite(f["path"], draw(img, dets))   # l'image vue par le laboratoire montre les boîtes de l'expert
-    audit(u, "annotate", f"file {fid}"); return {"saved": len(lines), "review": "pending"}
+    audit(u, "annotate", f"file {fid}"); return {"saved": len(lines), "negative": not lines, "review": "pending"}
 
 # ---------- Administration centrale ----------
 @app.get("/api/central/overview")
@@ -323,7 +337,7 @@ def c_lab_expert(lid: int, r: ExpertFlag, u=Depends(central)):
 
 @app.get("/api/central/annotations")
 def c_ann(review: str = "pending", u=Depends(central)):
-    return q("""SELECT a.file_id,a.review,COUNT(*) boxes,GROUP_CONCAT(DISTINCT a.label) labels,l.name lab,e.name expert,MAX(a.created) created
+    return q("""SELECT a.file_id,a.review,SUM(a.label!='__NEG__') boxes,GROUP_CONCAT(DISTINCT a.label) labels,l.name lab,e.name expert,MAX(a.created) created
       FROM annotations a JOIN cases c ON c.id=a.case_id JOIN labs l ON l.id=c.lab_id LEFT JOIN users e ON e.id=a.expert_id
       WHERE a.review=? GROUP BY a.file_id ORDER BY created DESC LIMIT 300""", (review,))
 
@@ -339,15 +353,57 @@ def c_file_review(fid: int, r: Review, u=Depends(central)):
     else: _rm(f"{DS}/images/dap_{fid}.jpg"); _rm(f"{DS}/labels/dap_{fid}.txt")
     audit(u, "annotation_" + r.action, f"file {fid}"); return {"ok": True}
 
+def _iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1])); i = ix * iy
+    u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i
+    return i / u if u > 0 else 0.0
+
+@app.get("/api/central/concordance")
+def c_concordance(u=Depends(central)):
+    """Concordance IA / expert : on compare les prédictions d'origine du modèle aux boîtes de l'expert (appariement IoU >= 0,5)."""
+    fids = [r["file_id"] for r in q("SELECT DISTINCT a.file_id FROM annotations a JOIN ai_files f ON f.file_id=a.file_id WHERE a.review!='rejected'")]
+    tp, fp, fn, conf = {}, {}, {}, {}; n_ai = n_gt = missed_unknown = neg_imgs = neg_fa = 0
+    inc = lambda d, k: d.__setitem__(k, d.get(k, 0) + 1)
+    for fid in fids:
+        ai = [(r["parasite"], (r["x0"], r["y0"], r["x1"], r["y1"])) for r in q("SELECT parasite,x0,y0,x1,y1 FROM ai_preds WHERE file_id=?", (fid,))]
+        gt_all = q("SELECT label,x0,y0,x1,y1 FROM annotations WHERE file_id=?", (fid,))
+        if any(g["label"] == NEG for g in gt_all):
+            neg_imgs += 1; neg_fa += 1 if ai else 0
+        gt = [(g["label"], (g["x0"], g["y0"], g["x1"], g["y1"])) for g in gt_all if g["label"] != NEG]
+        n_ai += len(ai); n_gt += len(gt)
+        pairs = sorted(((_iou(a[1], g[1]), i, j) for i, a in enumerate(ai) for j, g in enumerate(gt)), reverse=True)
+        ua, ug = set(), set()
+        for v, i, j in pairs:
+            if v < 0.5: break
+            if i in ua or j in ug: continue
+            ua.add(i); ug.add(j)
+            if ai[i][0] == gt[j][0]: inc(tp, ai[i][0])
+            else: inc(fp, ai[i][0]); inc(conf, (ai[i][0], gt[j][0])); (inc(fn, gt[j][0]) if gt[j][0] in LABELS else None)
+        for i, a in enumerate(ai):
+            if i not in ua: inc(fp, a[0])
+        for j, g in enumerate(gt):
+            if j not in ug: (inc(fn, g[0]) if g[0] in LABELS else None); missed_unknown += 0 if g[0] in LABELS else 1
+    ratio = lambda a, b: round(a / b, 3) if b else None
+    rows = []
+    for c in LABELS:
+        t_, f_, n_ = tp.get(c, 0), fp.get(c, 0), fn.get(c, 0)
+        if t_ + f_ + n_: rows.append({"label": c, "tp": t_, "fp": f_, "fn": n_, "precision": ratio(t_, t_ + f_), "recall": ratio(t_, t_ + n_)})
+    T_, F_, N_ = sum(tp.values()), sum(fp.values()), sum(fn.values())
+    p, r = ratio(T_, T_ + F_), ratio(T_, T_ + N_)
+    return {"images": len(fids), "ai_boxes": n_ai, "expert_boxes": n_gt, "tp": T_, "fp": F_, "fn": N_, "precision": p, "recall": r,
+            "f1": round(2 * p * r / (p + r), 3) if p and r else None, "by_class": rows, "missed_unknown": missed_unknown,
+            "negatives": {"images": neg_imgs, "with_ai_detection": neg_fa},
+            "confusions": [{"ai": a, "expert": b, "n": n} for (a, b), n in sorted(conf.items(), key=lambda kv: -kv[1])[:10]]}
+
 @app.get("/api/central/audit")
 def c_audit(u=Depends(central)):
     return q("SELECT a.ts,a.action,a.target,u.name,u.email,l.name lab FROM audit a LEFT JOIN users u ON u.id=a.user_id LEFT JOIN labs l ON l.id=a.lab_id ORDER BY a.id DESC LIMIT 300")
 
 @app.get("/api/dataset/stats")
 def ds_stats(u=Depends(central)):
-    return {"images": q("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='approved'", (), True)["n"], "boxes": q("SELECT COUNT(*) n FROM annotations WHERE review='approved'", (), True)["n"],
+    return {"images": q("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='approved'", (), True)["n"], "boxes": q("SELECT COUNT(*) n FROM annotations WHERE review='approved' AND label!='__NEG__'", (), True)["n"], "negatives": q("SELECT COUNT(*) n FROM annotations WHERE review='approved' AND label='__NEG__'", (), True)["n"],
             "pending": q("SELECT COUNT(DISTINCT file_id) n FROM annotations WHERE review='pending'", (), True)["n"],
-            "by_class": q("SELECT label,COUNT(*) n FROM annotations WHERE review='approved' GROUP BY label ORDER BY n DESC")}
+            "by_class": q("SELECT label,COUNT(*) n FROM annotations WHERE review='approved' AND label!='__NEG__' GROUP BY label ORDER BY n DESC")}
 
 def _ds_rows(review="all", parasite=""):
     """Une ligne par IMAGE annotée (train + label YOLO), avec établissement source et nom de l'expert."""
@@ -356,9 +412,10 @@ def _ds_rows(review="all", parasite=""):
       WHERE (?='all' OR a.review=?) ORDER BY a.file_id DESC, a.id""", (review, review))
     out = {}
     for r in rows:
-        o = out.setdefault(r["file_id"], {"file_id": r["file_id"], "case_id": r["case_id"], "review": r["review"], "lab": r["lab"], "expert": r["expert"], "created": r["created"], "labels": {}, "yolo": []})
-        o["labels"][r["label"]] = o["labels"].get(r["label"], 0) + 1
+        o = out.setdefault(r["file_id"], {"file_id": r["file_id"], "case_id": r["case_id"], "review": r["review"], "lab": r["lab"], "expert": r["expert"], "created": r["created"], "labels": {}, "yolo": [], "negative": False})
         o["created"] = max(o["created"] or 0, r["created"] or 0)
+        if r["label"] == NEG: o["negative"] = True; continue   # image sans parasite : fichier label YOLO vide
+        o["labels"][r["label"]] = o["labels"].get(r["label"], 0) + 1
         o["yolo"].append(f"{CLASSES.index(r['label'])} {(r['x0']+r['x1'])/2:.6f} {(r['y0']+r['y1'])/2:.6f} {r['x1']-r['x0']:.6f} {r['y1']-r['y0']:.6f}")
     res = [dict(o, yolo="\n".join(o["yolo"])) for o in out.values() if not parasite or parasite.lower() in " ".join(o["labels"]).lower()]
     return sorted(res, key=lambda o: o["created"] or 0, reverse=True)
@@ -379,7 +436,7 @@ def ds_zip(u=Depends(central)):
         for o in rows:
             fid = o["file_id"]; sp = "val" if fid % 7 == 0 else "train"
             shutil.copy(f"{DS}/images/dap_{fid}.jpg", f"{tmp}/{sp}/images/dap_{fid}.jpg"); shutil.copy(f"{DS}/labels/dap_{fid}.txt", f"{tmp}/{sp}/labels/dap_{fid}.txt")
-            w.writerow([sp, f"{sp}/images/dap_{fid}.jpg", f"{sp}/labels/dap_{fid}.txt", o["lab"], o["expert"] or "", "; ".join(f"{k} x{n}" for k, n in o["labels"].items())])
+            w.writerow([sp, f"{sp}/images/dap_{fid}.jpg", f"{sp}/labels/dap_{fid}.txt", o["lab"], o["expert"] or "", "; ".join(f"{k} x{n}" for k, n in o["labels"].items()) or "(sans parasite)"])
     has_val = any(os.listdir(f"{tmp}/val/images"))
     open(tmp + "/data.yaml", "w").write("path: .\ntrain: train/images\nval: " + ("val/images" if has_val else "train/images") + "\nnames:\n" + "".join(f"  {i}: {n}\n" for i, n in enumerate(CLASSES)))
     arc = shutil.make_archive(DATA + "/dap_dataset", "zip", tmp); shutil.rmtree(tmp, ignore_errors=True)
