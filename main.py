@@ -41,10 +41,9 @@ for s in ["""CREATE TABLE IF NOT EXISTS labs(id INTEGER PRIMARY KEY, name, type,
     q(s)
 
 q("CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY, case_id INT, file_id INT, label, x0 REAL, y0 REAL, x1 REAL, y1 REAL, expert_id INT, created REAL)")
-for m in ["ALTER TABLE labs ADD COLUMN status", "ALTER TABLE sessions ADD COLUMN created REAL", "ALTER TABLE annotations ADD COLUMN review", "ALTER TABLE annotations ADD COLUMN reviewed_by INT", "ALTER TABLE annotations ADD COLUMN reviewed_at REAL", "ALTER TABLE annotations ADD COLUMN meas", "ALTER TABLE findings ADD COLUMN meas"]:
+for m in ["ALTER TABLE labs ADD COLUMN status", "ALTER TABLE sessions ADD COLUMN created REAL", "ALTER TABLE annotations ADD COLUMN review", "ALTER TABLE annotations ADD COLUMN reviewed_by INT", "ALTER TABLE annotations ADD COLUMN reviewed_at REAL"]:
     try: q(m)
     except Exception: pass
-q("CREATE TABLE IF NOT EXISTS calib(lab_id INT, obj TEXT, fov_um REAL, by_user INT, ts REAL, PRIMARY KEY(lab_id,obj))")
 q("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, user_id INT, lab_id INT, action, target, ts REAL)")
 q("UPDATE labs SET status='approved' WHERE status IS NULL")
 q("UPDATE annotations SET review='pending' WHERE review IS NULL")
@@ -187,7 +186,7 @@ def case(cid: int, u=Depends(user)):
     refs = q("SELECT r.*,a.name from_name,b.name to_name,(SELECT name FROM users WHERE id=r.expert_id) expert_name FROM referrals r JOIN labs a ON a.id=r.from_lab JOIN labs b ON b.id=r.to_lab WHERE case_id=? ORDER BY r.id DESC", (cid,))
     can_review = any(r["to_lab"] == u["lab_id"] and r["status"] == "en_attente" for r in refs) and u["role"] in ("expert", "admin")
     return {"case": c, "own": own, "files": q("SELECT id,name,kind,parent FROM files WHERE case_id=?", (cid,)),
-            "findings": [dict(x, dims=_dims_txt(x.pop("meas"), c["lab_id"])) for x in q("SELECT id,file_id,parasite,conf,status,box,meas FROM findings WHERE case_id=?", (cid,))], "referrals": refs, "can_review": can_review}
+            "findings": q("SELECT id,file_id,parasite,conf,status,box FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review}
 
 @app.post("/api/cases/{cid}/files")
 async def upload(cid: int, files: List[UploadFile] = File(default=[]), u=Depends(user)):
@@ -254,79 +253,18 @@ def report(rid: int, r: Report, u=Depends(user)):
 @app.get("/api/classes")
 def classes(u=Depends(user)): return {"model": LABELS, "extra": EXTRA, "other": OTHER}
 
-OBJS = ("x4", "x10", "x40", "x100")
-class AnnBox(BaseModel): label: str; box: List[float]; meas: Optional[dict] = None  # box [x0,y0,x1,y1] normalisés 0-1 ; meas {obj, l:[x0,y0,x1,y1], w:[...]} normalisés
+class AnnBox(BaseModel): label: str; box: List[float]  # [x0,y0,x1,y1] normalisés 0-1
 class AnnIn(BaseModel): boxes: List[AnnBox]
-class CalIn(BaseModel): obj: str; known_um: float; line: List[float]
 
 def _file(fid, u):
     f = q("SELECT * FROM files WHERE id=?", (fid,), True)
     if not f: raise HTTPException(404)
     access(f["case_id"], u); return f
 
-def _file_any(fid, u):
-    """Comme _file, mais l'administration centrale peut lire (lecture seule)."""
-    if u["role"] == "central":
-        f = q("SELECT * FROM files WHERE id=?", (fid,), True)
-        if not f: raise HTTPException(404)
-        return f
-    return _file(fid, u)
-
-def _lab_of_case(cid): return q("SELECT lab_id FROM cases WHERE id=?", (cid,), True)["lab_id"]
-
-def _clean_line(v):
-    if not v or len(v) != 4: return None
-    v = [min(max(float(x), 0.0), 1.0) for x in v]; return v
-
-def _dims(meas, lab_id):
-    """Calcule longueur/largeur : en pixels de l'image d'origine, et en µm si l'objectif est calibré (fov_um = largeur de l'image en µm)."""
-    if not meas: return None
-    try: m = json.loads(meas) if isinstance(meas, str) else meas
-    except Exception: return None
-    iw, ih = m.get("iw") or 0, m.get("ih") or 0
-    if not iw or not ih: return None
-    cal = q("SELECT fov_um FROM calib WHERE lab_id=? AND obj=?", (lab_id, m.get("obj")), True)
-    um_px = cal["fov_um"] / iw if cal else None
-    out = {"obj": m.get("obj"), "l": m.get("l"), "w": m.get("w"), "calibrated": bool(cal)}
-    for k in ("l", "w"):
-        ln = m.get(k)
-        px = math.hypot((ln[2] - ln[0]) * iw, (ln[3] - ln[1]) * ih) if ln else None
-        out[k + "_px"] = round(px, 1) if px is not None else None
-        out[k + "_um"] = round(px * um_px, 1) if (px is not None and um_px) else None
-    return out
-
-def _dims_txt(meas, lab_id):
-    d = _dims(meas, lab_id)
-    if not d or not d["calibrated"]: return None
-    v = [d["l_um"], d["w_um"]]; v = [x for x in v if x is not None]
-    return (" × ".join("%.1f" % x for x in v) + " µm") if v else None
-
 @app.get("/api/files/{fid}/annotations")
 def get_ann(fid: int, u=Depends(user)):
-    f = _file_any(fid, u); lab = _lab_of_case(f["case_id"])
-    rows = q("SELECT label,x0,y0,x1,y1,review,meas FROM annotations WHERE file_id=?", (fid,))
-    for r in rows: r["meas"] = _dims(r["meas"], lab)
-    return rows
-
-@app.get("/api/files/{fid}/calibration")
-def get_cal(fid: int, u=Depends(user)):
-    f = _file_any(fid, u)
-    return {r["obj"]: r["fov_um"] for r in q("SELECT obj,fov_um FROM calib WHERE lab_id=?", (_lab_of_case(f["case_id"]),))}
-
-@app.post("/api/files/{fid}/calibration")
-def set_cal(fid: int, c: CalIn, u=Depends(user)):
-    """Calibration d'un objectif : l'expert trace une ligne sur une distance connue (lame micrométrique). On mémorise la largeur de l'image en µm pour le laboratoire d'origine."""
-    if u["role"] not in ("expert", "admin") or not u["has_expert"]: raise HTTPException(403, "Réservé à l'expert")
-    if c.obj not in OBJS: raise HTTPException(400, "Objectif inconnu")
-    f = _file(fid, u); img = cv2.imread(f["raw"] or f["path"])
-    if img is None: raise HTTPException(400, "Image illisible")
-    ln = _clean_line(c.line)
-    if not ln or c.known_um <= 0 or c.known_um > 5000: raise HTTPException(400, "Valeur invalide")
-    IH, IW = img.shape[:2]; px = math.hypot((ln[2] - ln[0]) * IW, (ln[3] - ln[1]) * IH)
-    if px < 10: raise HTTPException(400, "Ligne trop courte")
-    fov = c.known_um * IW / px; lab = _lab_of_case(f["case_id"])
-    q("INSERT OR REPLACE INTO calib(lab_id,obj,fov_um,by_user,ts) VALUES(?,?,?,?,?)", (lab, c.obj, fov, u["id"], time.time()))
-    audit(u, "calibrate", f"lab {lab} {c.obj}"); return {"obj": c.obj, "fov_um": fov, "um_per_px": fov / IW}
+    if u["role"] == "central": return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=?", (fid,))
+    _file(fid, u); return q("SELECT label,x0,y0,x1,y1,review FROM annotations WHERE file_id=?", (fid,))
 
 def _rm(p):
     try: os.remove(p)
@@ -345,15 +283,11 @@ def save_ann(fid: int, a: AnnIn, u=Depends(user)):
         if b.label not in CLASSES: raise HTTPException(400, "Classe inconnue : " + b.label)
         x0, y0, x1, y1 = [min(max(v, 0.0), 1.0) for v in b.box]; x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
         if x1 - x0 < .005 or y1 - y0 < .005: continue
-        mj = None
-        if b.meas:
-            ml, mw = _clean_line(b.meas.get("l")), _clean_line(b.meas.get("w")); ob = b.meas.get("obj")
-            if (ml or mw) and ob in OBJS: mj = json.dumps({"obj": ob, "l": ml, "w": mw, "iw": IW, "ih": IH})
         dets.append({"parasite": b.label, "class_id": CLASSES.index(b.label), "conf": None, "box": [x0 * IW, y0 * IH, x1 * IW, y1 * IH]})
         if b.label not in OTHER:   # artéfacts / levures / débris : gardés pour l'entraînement, pas comptés comme parasites
-            q("INSERT INTO findings(case_id,file_id,parasite,conf,box,status,confirmed_by,confirmed_at,meas) VALUES(?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, None, json.dumps([x0 * IW, y0 * IH, x1 * IW, y1 * IH]), "confirmed", u["id"], time.time(), mj))
+            q("INSERT INTO findings(case_id,file_id,parasite,conf,box,status,confirmed_by,confirmed_at) VALUES(?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, None, json.dumps([x0 * IW, y0 * IH, x1 * IW, y1 * IH]), "confirmed", u["id"], time.time()))
         lines.append(f"{CLASSES.index(b.label)} {(x0+x1)/2:.6f} {(y0+y1)/2:.6f} {x1-x0:.6f} {y1-y0:.6f}")
-        q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created,review,meas) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, x0, y0, x1, y1, u["id"], time.time(), "pending", mj))
+        q("INSERT INTO annotations(case_id,file_id,label,x0,y0,x1,y1,expert_id,created,review) VALUES(?,?,?,?,?,?,?,?,?,?)", (f["case_id"], fid, b.label, x0, y0, x1, y1, u["id"], time.time(), "pending"))
     _rm(f"{DS}/images/dap_{fid}.jpg"); _rm(f"{DS}/labels/dap_{fid}.txt")   # toute modification annule une validation antérieure
     cv2.imwrite(f"{PD}/images/dap_{fid}.jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 95])
     open(f"{PD}/labels/dap_{fid}.txt", "w").write("\n".join(lines))
@@ -496,7 +430,7 @@ def _report_pdf(cid, u):
     P = lambda size=9, bold=False, **k: ParagraphStyle("p", fontName=_F["b"] if bold else _F["n"], fontSize=size, leading=size * 1.4, **k)
     N, B = P(9), P(9, True)
     exp = q("SELECT r.*,b.name to_name,b.wilaya to_wilaya,e.name expert_name FROM referrals r JOIN labs b ON b.id=r.to_lab LEFT JOIN users e ON e.id=r.expert_id WHERE r.case_id=? AND r.status='expertisé' ORDER BY r.id DESC LIMIT 1", (cid,), True)
-    fs = q("SELECT parasite,conf,status,meas FROM findings WHERE case_id=? AND status!='rejected' ORDER BY status,conf DESC", (cid,))
+    fs = q("SELECT parasite,conf,status FROM findings WHERE case_id=? AND status!='rejected' ORDER BY status,conf DESC", (cid,))
     fmt = lambda t: time.strftime("%d/%m/%Y", time.localtime(t))
     S = []
     head = Table([[Paragraph("République Algérienne Démocratique et Populaire<br/>Ministère de la Santé", P(8.5, True, alignment=0)),
@@ -513,9 +447,9 @@ def _report_pdf(cid, u):
     if c["notes"]: S += [Paragraph("<b>Renseignements cliniques :</b> " + T(c["notes"]), N), Spacer(1, 6)]
     lbl = {"auto": "Détection IA (à valider)", "confirmed": "Confirmé / identifié par l'expert"}
     S += [Paragraph("EXAMEN MICROSCOPIQUE DIRECT / " + T("الفحص المجهري المباشر"), P(10, True)), Spacer(1, 3)]
-    rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut", "Dimensions (approx.)"]] + [[Paragraph(T(x["parasite"]), N), ("-" if x["conf"] is None else "%d %%" % round(x["conf"] * 100)), Paragraph(lbl.get(x["status"], x["status"]), N), _dims_txt(x["meas"], c["lab_id"]) or "-"] for x in fs]
-    if not fs: rows.append([Paragraph("Absence d'élément parasitaire détecté sur les images analysées / " + T("لم يتم الكشف عن أي طفيلي"), N), "", "", ""])
-    tb = Table(rows, colWidths=[6.4*cm, 2.2*cm, 4.4*cm, 4*cm], repeatRows=1)
+    rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut"]] + [[Paragraph(T(x["parasite"]), N), ("-" if x["conf"] is None else "%d %%" % round(x["conf"] * 100)), lbl.get(x["status"], x["status"])] for x in fs]
+    if not fs: rows.append([Paragraph("Absence d'élément parasitaire détecté sur les images analysées / " + T("لم يتم الكشف عن أي طفيلي"), N), "", ""])
+    tb = Table(rows, colWidths=[9*cm, 3*cm, 5*cm], repeatRows=1)
     tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _F["n"]), ("FONTNAME", (0, 0), (-1, 0), _F["b"]), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2f3f1")), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); S += [tb, Spacer(1, 8)]
     conf_names = {}
     for x in fs:
