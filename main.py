@@ -469,12 +469,13 @@ def T(t):
     return X(t).replace("\n", "<br/>")
 
 @app.get("/api/cases/{cid}/report.pdf")
-def report_pdf(cid: int, u=Depends(user)):
-    try: return _report_pdf(cid, u)
+def report_pdf(cid: int, lang: str = "fr", u=Depends(user)):
+    try: return _report_pdf(cid, u, lang)
     except HTTPException: raise
     except Exception as e: raise HTTPException(500, f"Erreur de génération du PDF : {type(e).__name__}: {e}")
 
-def _report_pdf(cid, u):
+def _report_pdf(cid, u, lang="fr"):
+    L = lambda fr, en: en if lang == "en" else fr
     """Compte rendu d'examen parasitologique des selles, mise en page type compte rendu de laboratoire algérien (bilingue FR/AR)."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
@@ -490,31 +491,31 @@ def _report_pdf(cid, u):
     fs = q("SELECT parasite,conf,status FROM findings WHERE case_id=? AND status!='rejected' ORDER BY status,conf DESC", (cid,))
     fmt = lambda t: time.strftime("%d/%m/%Y", time.localtime(t))
     S = []
-    head = Table([[Paragraph("République Algérienne Démocratique et Populaire<br/>Ministère de la Santé", P(8.5, True, alignment=0)),
+    head = Table([[Paragraph("" + L("République Algérienne Démocratique et Populaire<br/>Ministère de la Santé", "People's Democratic Republic of Algeria<br/>Ministry of Health") + "", P(8.5, True, alignment=0)),
                    Paragraph(T("الجمهورية الجزائرية الديمقراطية الشعبية") + "<br/>" + T("وزارة الصحة"), P(9.5, True, alignment=TA_RIGHT))]], colWidths=[9*cm, 8*cm])
     head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")])); S += [head, Spacer(1, 6)]
     S += [Paragraph(T(lab["name"]) + (" - " + T(lab["wilaya"]) if lab["wilaya"] else ""), P(12, True, alignment=TA_CENTER)),
-          Paragraph(T(lab["address"] or "") + ((" - Tél : " + T(lab["phone"])) if lab["phone"] else ""), P(8, alignment=TA_CENTER)), Spacer(1, 10)]
-    tt = Table([[Paragraph("COMPTE RENDU D'EXAMEN PARASITOLOGIQUE DES SELLES<br/>" + T("نتيجة الفحص الطفيلي للبراز"), P(11, True, alignment=TA_CENTER, textColor=colors.white))]], colWidths=[17*cm])
+          Paragraph(T(lab["address"] or "") + (("" + L(" - Tél : ", " - Tel: ") + "" + T(lab["phone"])) if lab["phone"] else ""), P(8, alignment=TA_CENTER)), Spacer(1, 10)]
+    tt = Table([[Paragraph("" + L("COMPTE RENDU D'EXAMEN PARASITOLOGIQUE DES SELLES<br/>", "STOOL PARASITOLOGY EXAMINATION REPORT<br/>") + "" + T("نتيجة الفحص الطفيلي للبراز"), P(11, True, alignment=TA_CENTER, textColor=colors.white))]], colWidths=[17*cm])
     tt.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0f766e")), ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)])); S += [tt, Spacer(1, 8)]
-    pat = Table([[Paragraph("<b>Nom et prénom / " + T("الاسم واللقب") + " :</b> " + T(c["patient_ref"]), N), Paragraph("<b>N° dossier :</b> %s-%05d" % (lab["id"], cid), N)],
-                 [Paragraph("<b>Âge / " + T("السن") + " :</b> " + T(c["age"] or "-") + " &nbsp;&nbsp; <b>Sexe / " + T("الجنس") + " :</b> " + T(c["sex"] or "-"), N), Paragraph("<b>Date de réception :</b> " + fmt(c["created"]), N)],
-                 [Paragraph("<b>Nature du prélèvement :</b> " + T(c["sample_type"]), N), Paragraph("<b>Date du résultat :</b> " + fmt(exp["reviewed_at"] if exp else time.time()), N)]], colWidths=[10.5*cm, 6.5*cm])
+    pat = Table([[Paragraph("<b>" + L("Nom et prénom / ", "Patient name / ") + "" + T("الاسم واللقب") + " :</b> " + T(c["patient_ref"]), N), Paragraph("<b>" + L("N° dossier :", "Case no.:") + "</b> %s-%05d" % (lab["id"], cid), N)],
+                 [Paragraph("<b>" + L("Âge / ", "Age / ") + "" + T("السن") + " :</b> " + T(c["age"] or "-") + " &nbsp;&nbsp; <b>" + L("Sexe / ", "Sex / ") + "" + T("الجنس") + " :</b> " + T(c["sex"] or "-"), N), Paragraph("<b>" + L("Date de réception :", "Date received:") + "</b> " + fmt(c["created"]), N)],
+                 [Paragraph("<b>" + L("Nature du prélèvement :", "Sample type:") + "</b> " + T(c["sample_type"]), N), Paragraph("<b>" + L("Date du résultat :", "Result date:") + "</b> " + fmt(exp["reviewed_at"] if exp else time.time()), N)]], colWidths=[10.5*cm, 6.5*cm])
     pat.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .6, colors.grey), ("INNERGRID", (0, 0), (-1, -1), .25, colors.lightgrey), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)])); S += [pat, Spacer(1, 8)]
-    if c["notes"]: S += [Paragraph("<b>Renseignements cliniques :</b> " + T(c["notes"]), N), Spacer(1, 6)]
-    lbl = {"auto": "Détection IA (à valider)", "confirmed": "Confirmé / identifié par l'expert"}
-    S += [Paragraph("EXAMEN MICROSCOPIQUE DIRECT / " + T("الفحص المجهري المباشر"), P(10, True)), Spacer(1, 3)]
-    rows = [["Élément parasitaire retrouvé", "Confiance IA", "Statut"]] + [[Paragraph(T(x["parasite"]), N), ("-" if x["conf"] is None else "%d %%" % round(x["conf"] * 100)), lbl.get(x["status"], x["status"])] for x in fs]
-    if not fs: rows.append([Paragraph("Absence d'élément parasitaire détecté sur les images analysées / " + T("لم يتم الكشف عن أي طفيلي"), N), "", ""])
+    if c["notes"]: S += [Paragraph("<b>" + L("Renseignements cliniques :", "Clinical information:") + "</b> " + T(c["notes"]), N), Spacer(1, 6)]
+    lbl = {"auto": "" + L("Détection IA (à valider)", "AI detection (to be validated)") + "", "confirmed": "" + L("Confirmé / identifié par l'expert", "Confirmed / identified by the expert") + ""}
+    S += [Paragraph("" + L("EXAMEN MICROSCOPIQUE DIRECT / ", "DIRECT MICROSCOPIC EXAMINATION / ") + "" + T("الفحص المجهري المباشر"), P(10, True)), Spacer(1, 3)]
+    rows = [["" + L("Élément parasitaire retrouvé", "Parasitic element found") + "", "" + L("Confiance IA", "AI confidence") + "", L("Statut", "Status")]] + [[Paragraph(T(x["parasite"]), N), ("-" if x["conf"] is None else "%d %%" % round(x["conf"] * 100)), lbl.get(x["status"], x["status"])] for x in fs]
+    if not fs: rows.append([Paragraph("" + L("Absence d'élément parasitaire détecté sur les images analysées / ", "No parasitic element detected on the analysed images / ") + "" + T("لم يتم الكشف عن أي طفيلي"), N), "", ""])
     tb = Table(rows, colWidths=[9*cm, 3*cm, 5*cm], repeatRows=1)
     tb.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _F["n"]), ("FONTNAME", (0, 0), (-1, 0), _F["b"]), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2f3f1")), ("GRID", (0, 0), (-1, -1), .4, colors.grey), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])); S += [tb, Spacer(1, 8)]
     conf_names = {}
     for x in fs:
         if x["status"] == "confirmed": conf_names[x["parasite"]] = conf_names.get(x["parasite"], 0) + 1
-    if conf_names: S += [Paragraph("<b>Éléments parasitaires confirmés par l'expert :</b> " + T(", ".join(f"{k} (x{v})" for k, v in conf_names.items())), N), Spacer(1, 6)]
+    if conf_names: S += [Paragraph("<b>" + L("Éléments parasitaires confirmés par l'expert :", "Parasitic elements confirmed by the expert:") + "</b> " + T(", ".join(f"{k} (x{v})" for k, v in conf_names.items())), N), Spacer(1, 6)]
     S += [Paragraph("CONCLUSION / " + T("الخلاصة"), P(10, True)), Spacer(1, 3)]
     if exp: S += [Paragraph(T(exp["verdict"] or ""), B), Paragraph(T(exp["report"] or ""), N)]
-    else: S += [Paragraph("Résultat PRÉLIMINAIRE établi par intelligence artificielle, non encore validé par un médecin expert. Ne pas utiliser seul pour une décision thérapeutique.", B)]
+    else: S += [Paragraph("" + L("Résultat PRÉLIMINAIRE établi par intelligence artificielle, non encore validé par un médecin expert. Ne pas utiliser seul pour une décision thérapeutique.", "PRELIMINARY result produced by artificial intelligence, not yet validated by an expert physician. Do not use alone for a therapeutic decision.") + "", B)]
     S.append(Spacer(1, 8))
     imgs = [f["path"] for f in q("SELECT path FROM files WHERE case_id=? AND kind='annotée' LIMIT 4", (cid,)) if f["path"] and os.path.exists(f["path"])]
     cells = []
@@ -522,13 +523,13 @@ def _report_pdf(cid, u):
         im = cv2.imread(p)
         if im is not None: h, w = im.shape[:2]; k = min(8*cm / w, 6*cm / h); cells.append(RI(p, width=w * k, height=h * k))
     if cells:
-        S.append(Paragraph("Images analysées / " + T("الصور المحللة"), P(9, True))); S.append(Spacer(1, 3))
+        S.append(Paragraph("" + L("Images analysées / ", "Analysed images / ") + "" + T("الصور المحللة"), P(9, True))); S.append(Spacer(1, 3))
         g = Table([cells[i:i + 2] + [""] * (2 - len(cells[i:i + 2])) for i in range(0, len(cells), 2)], colWidths=[8.5*cm, 8.5*cm]); S += [g, Spacer(1, 8)]
-    sig = Table([[Paragraph("Le technicien / Le biologiste<br/>" + T("التقني / البيولوجي"), P(8.5, True, alignment=TA_CENTER)),
-                  Paragraph("Le médecin expert<br/>" + T("الطبيب الخبير") + ((" : " + T(exp["expert_name"] or "") + "<br/>" + T(exp["to_name"])) if exp else ""), P(8.5, True, alignment=TA_CENTER)),
-                  Paragraph("Cachet<br/>" + T("الختم"), P(8.5, True, alignment=TA_CENTER))], ["", "", ""]], colWidths=[5.6*cm] * 3, rowHeights=[1.9*cm, 2.2*cm])
+    sig = Table([[Paragraph("" + L("Le technicien / Le biologiste<br/>", "Technician / Biologist<br/>") + "" + T("التقني / البيولوجي"), P(8.5, True, alignment=TA_CENTER)),
+                  Paragraph("" + L("Le médecin expert<br/>", "Expert physician<br/>") + "" + T("الطبيب الخبير") + ((" : " + T(exp["expert_name"] or "") + "<br/>" + T(exp["to_name"])) if exp else ""), P(8.5, True, alignment=TA_CENTER)),
+                  Paragraph("" + L("Cachet<br/>", "Stamp<br/>") + "" + T("الختم"), P(8.5, True, alignment=TA_CENTER))], ["", "", ""]], colWidths=[5.6*cm] * 3, rowHeights=[1.9*cm, 2.2*cm])
     sig.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .5, colors.grey), ("INNERGRID", (0, 0), (-1, -1), .25, colors.lightgrey), ("VALIGN", (0, 0), (-1, 0), "MIDDLE")]))
-    S += [KeepTogether([sig, Spacer(1, 6), Paragraph("Document généré par la plateforme DAP. Les détections par IA constituent une aide au diagnostic et doivent être validées par un professionnel de santé qualifié.", P(7, alignment=TA_CENTER, textColor=colors.grey))])]
+    S += [KeepTogether([sig, Spacer(1, 6), Paragraph("" + L("Document généré par la plateforme DAP. Les détections par IA constituent une aide au diagnostic et doivent être validées par un professionnel de santé qualifié.", "Document generated by the DAP platform. AI detections are a diagnostic aid and must be validated by a qualified healthcare professional.") + "", P(7, alignment=TA_CENTER, textColor=colors.grey))])]
     buf = io.BytesIO(); SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=1.5*cm, bottomMargin=1.5*cm, title=f"Compte rendu {lab['id']}-{cid}").build(S)
     return Response(buf.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="compte_rendu_{cid}.pdf"'})
 
