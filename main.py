@@ -41,7 +41,7 @@ for s in ["""CREATE TABLE IF NOT EXISTS labs(id INTEGER PRIMARY KEY, name, type,
     q(s)
 
 q("CREATE TABLE IF NOT EXISTS annotations(id INTEGER PRIMARY KEY, case_id INT, file_id INT, label, x0 REAL, y0 REAL, x1 REAL, y1 REAL, expert_id INT, created REAL)")
-for m in ["ALTER TABLE labs ADD COLUMN status", "ALTER TABLE sessions ADD COLUMN created REAL", "ALTER TABLE annotations ADD COLUMN review", "ALTER TABLE annotations ADD COLUMN reviewed_by INT", "ALTER TABLE annotations ADD COLUMN reviewed_at REAL"]:
+for m in ["ALTER TABLE labs ADD COLUMN status", "ALTER TABLE sessions ADD COLUMN created REAL", "ALTER TABLE annotations ADD COLUMN review", "ALTER TABLE annotations ADD COLUMN reviewed_by INT", "ALTER TABLE annotations ADD COLUMN reviewed_at REAL", "ALTER TABLE cases ADD COLUMN risk"]:
     try: q(m)
     except Exception: pass
 q("CREATE TABLE IF NOT EXISTS ai_files(file_id INTEGER PRIMARY KEY, n INT, ts REAL)")   # image analysée par l'IA (même si 0 détection)
@@ -120,7 +120,7 @@ class Reg(BaseModel):
     name: str; email: str; password: str
 class Login(BaseModel): email: str; password: str
 class NewUser(BaseModel): name: str; email: str; password: str; role: str = "tech"
-class NewCase(BaseModel): patient_ref: str; age: str = ""; sex: str = ""; sample_type: str = "Selles"; notes: str = ""
+class NewCase(BaseModel): patient_ref: str; age: str = ""; sex: str = ""; sample_type: str = "Selles"; notes: str = ""; risk: dict = {}
 class Refer(BaseModel): to_lab: int; message: str = ""
 class Report(BaseModel): verdict: str; report: str; findings: List[dict] = []  # [{id, status: confirmed|rejected}]
 
@@ -173,9 +173,48 @@ def add_user(n: NewUser, u=Depends(user)):
 def labs(u=Depends(user)):
     return q("SELECT id,name,type,wilaya,has_expert FROM labs WHERE has_expert=1 AND status='approved' AND id!=?", (u["lab_id"],))
 
+
+# ---- Profil de risque : estimation par RÈGLES simples (pas un modèle d'IA, pas un diagnostic) ----
+RISK_BOOL = ("water", "san", "bare", "soil", "nodw")
+RISK_SYMP = ("pain", "diar", "fat", "wt", "itch")
+def clean_risk(r):
+    r = r if isinstance(r, dict) else {}
+    out = {k: bool(r.get(k)) for k in RISK_BOOL}
+    sy = r.get("symptoms") or []
+    out["symptoms"] = [x for x in RISK_SYMP if x in sy] if isinstance(sy, list) else []
+    return out
+
+def risk_eval(raw, age, positive=False):
+    try: r = json.loads(raw) if raw else {}
+    except Exception: r = {}
+    r = clean_risk(r)
+    answered = any(r[k] for k in RISK_BOOL) or bool(r["symptoms"])
+    try: a = int(float(str(age).replace(",", ".").split()[0]))
+    except Exception: a = None
+    W = {"water": 2, "san": 2, "bare": 1, "soil": 1, "nodw": 1}; SW = {"pain": 1, "diar": 1, "fat": 2, "wt": 1, "itch": 1}
+    score, factors = 0, []
+    if a is not None and 2 <= a <= 14: score += 2; factors.append("age")
+    for k in RISK_BOOL:
+        if r[k]: score += W[k]; factors.append(k)
+    for k in r["symptoms"]: score += SW[k]; factors.append("s_" + k)
+    level = "low" if score <= 2 else ("moderate" if score <= 5 else "high")
+    adv = []
+    if not answered and not positive: adv = []
+    else:
+        adv.append("see" if (level != "low" or r["symptoms"] or positive) else "routine")
+        if any(r[k] for k in ("water", "san", "bare", "soil")): adv.append("hyg")
+        if r["symptoms"] and not positive: adv.append("repeat")
+        if "fat" in r["symptoms"]: adv.append("anemia")
+        if positive: adv.append("treat")
+    return {"answered": answered, "score": score, "level": level, "factors": factors, "advice": adv, "positive": positive, "inputs": r}
+
+def case_risk(c, cid):
+    pos = bool(q("SELECT 1 FROM findings WHERE case_id=? AND status!='rejected' LIMIT 1", (cid,)))
+    return risk_eval(c.get("risk"), c.get("age"), pos)
+
 @app.post("/api/cases")
 def new_case(c: NewCase, u=Depends(user)):
-    return {"id": q("INSERT INTO cases(lab_id,patient_ref,age,sex,sample_type,notes,status,created) VALUES(?,?,?,?,?,?,?,?)", (u["lab_id"], c.patient_ref, c.age, c.sex, c.sample_type, c.notes, "nouveau", time.time()))}
+    return {"id": q("INSERT INTO cases(lab_id,patient_ref,age,sex,sample_type,notes,status,created,risk) VALUES(?,?,?,?,?,?,?,?,?)", (u["lab_id"], c.patient_ref, c.age, c.sex, c.sample_type, c.notes, "nouveau", time.time(), json.dumps(clean_risk(c.risk))))}
 
 @app.get("/api/cases")
 def cases(u=Depends(user)):
@@ -189,7 +228,7 @@ def case(cid: int, u=Depends(user)):
     refs = q("SELECT r.*,a.name from_name,b.name to_name,(SELECT name FROM users WHERE id=r.expert_id) expert_name FROM referrals r JOIN labs a ON a.id=r.from_lab JOIN labs b ON b.id=r.to_lab WHERE case_id=? ORDER BY r.id DESC", (cid,))
     can_review = any(r["to_lab"] == u["lab_id"] and r["status"] == "en_attente" for r in refs) and u["role"] in ("expert", "admin")
     return {"case": c, "own": own, "files": q("SELECT id,name,kind,parent FROM files WHERE case_id=?", (cid,)),
-            "findings": q("SELECT id,file_id,parasite,conf,status,box FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review}
+            "findings": q("SELECT id,file_id,parasite,conf,status,box FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review, "risk_result": case_risk(c, cid)}
 
 @app.post("/api/cases/{cid}/files")
 async def upload(cid: int, files: List[UploadFile] = File(default=[]), u=Depends(user)):
@@ -474,6 +513,28 @@ def report_pdf(cid: int, lang: str = "fr", u=Depends(user)):
     except HTTPException: raise
     except Exception as e: raise HTTPException(500, f"Erreur de génération du PDF : {type(e).__name__}: {e}")
 
+
+RT = {
+ "title": {"fr": "PROFIL DE RISQUE (estimation par règles simples, non diagnostique)", "en": "RISK PROFILE (simple rule-based estimate, non-diagnostic)", "ar": "ملف الخطر (تقدير بقواعد بسيطة، وليس تشخيصًا)"},
+ "level": {"fr": "Niveau de risque", "en": "Risk level", "ar": "مستوى الخطر"},
+ "factors": {"fr": "Facteurs retenus", "en": "Factors considered", "ar": "العوامل المعتمدة"},
+ "advice": {"fr": "Suivi recommandé", "en": "Recommended follow-up", "ar": "المتابعة الموصى بها"},
+ "lv": {"low": {"fr": "faible", "en": "low", "ar": "منخفض"}, "moderate": {"fr": "modéré", "en": "moderate", "ar": "متوسط"}, "high": {"fr": "élevé", "en": "high", "ar": "مرتفع"}},
+ "f": {"age": {"fr": "âge 2–14 ans", "en": "age 2–14 years", "ar": "العمر 2–14 سنة"}, "water": {"fr": "eau de boisson non traitée", "en": "untreated drinking water", "ar": "ماء شرب غير معالج"},
+       "san": {"fr": "assainissement non amélioré", "en": "no improved sanitation", "ar": "غياب صرف صحي محسَّن"}, "bare": {"fr": "marche pieds nus", "en": "walks barefoot", "ar": "المشي حافي القدمين"},
+       "soil": {"fr": "contact fréquent avec la terre", "en": "frequent soil contact", "ar": "ملامسة متكررة للتربة"}, "nodw": {"fr": "pas de déparasitage depuis 12 mois", "en": "no deworming in 12 months", "ar": "لا علاج للديدان منذ 12 شهرًا"},
+       "s_pain": {"fr": "douleurs abdominales", "en": "abdominal pain", "ar": "ألم بطني"}, "s_diar": {"fr": "diarrhée", "en": "diarrhoea", "ar": "إسهال"}, "s_fat": {"fr": "fatigue / pâleur", "en": "fatigue / pallor", "ar": "إرهاق / شحوب"},
+       "s_wt": {"fr": "perte de poids", "en": "weight loss", "ar": "فقدان الوزن"}, "s_itch": {"fr": "démangeaisons anales / cutanées", "en": "anal / skin itching", "ar": "حكة شرجية / جلدية"}},
+ "a": {"routine": {"fr": "Pas de signe d'alerte : hygiène de base et suivi selon l'avis du médecin.", "en": "No warning sign: basic hygiene and follow-up as advised by a physician.", "ar": "لا علامات إنذار: النظافة الأساسية والمتابعة حسب رأي الطبيب."},
+       "see": {"fr": "Consultation médicale recommandée.", "en": "Medical consultation recommended.", "ar": "يُنصح باستشارة طبية."},
+       "hyg": {"fr": "Hygiène : eau potable, lavage des mains, chaussures, assainissement.", "en": "Hygiene: safe water, handwashing, footwear, sanitation.", "ar": "النظافة: ماء صالح للشرب، غسل اليدين، الأحذية، الصرف الصحي."},
+       "repeat": {"fr": "Un résultat négatif n'exclut pas une infection : répéter l'examen des selles (échantillons de jours différents) si les symptômes persistent.", "en": "A negative result does not rule out infection: repeat the stool examination (samples from different days) if symptoms persist.", "ar": "النتيجة السلبية لا تنفي العدوى: أعد فحص البراز (عينات من أيام مختلفة) إذا استمرت الأعراض."},
+       "anemia": {"fr": "Rechercher une anémie auprès d'un médecin.", "en": "Have anaemia checked by a physician.", "ar": "يُفحص فقر الدم لدى الطبيب."},
+       "treat": {"fr": "Parasite détecté : traitement et suivi décidés par un médecin.", "en": "Parasite detected: treatment and follow-up to be decided by a physician.", "ar": "تم الكشف عن طفيلي: العلاج والمتابعة يقررهما الطبيب."}},
+ "disc": {"fr": "Dépistage assisté par IA : ce n'est pas un diagnostic clinique définitif. Il doit être confirmé par un professionnel de santé qualifié ; en cas de symptômes ou de résultat positif, orienter le patient vers un médecin.",
+          "en": "AI-assisted screening: this is not a definitive clinical diagnosis. It must be confirmed by a qualified healthcare professional; in case of symptoms or a positive result, refer the patient to a physician.",
+          "ar": "فحص مدعوم بالذكاء الاصطناعي: ليس تشخيصًا سريريًا نهائيًا. يجب أن يؤكده مختص صحي مؤهل؛ وعند وجود أعراض أو نتيجة إيجابية يُحال المريض إلى طبيب."},
+}
 def _report_pdf(cid, u, lang="fr"):
     L = lambda fr, en: en if lang == "en" else fr
     """Compte rendu d'examen parasitologique des selles, mise en page type compte rendu de laboratoire algérien (bilingue FR/AR)."""
@@ -503,6 +564,14 @@ def _report_pdf(cid, u, lang="fr"):
                  [Paragraph("<b>" + L("Nature du prélèvement :", "Sample type:") + "</b> " + T(c["sample_type"]), N), Paragraph("<b>" + L("Date du résultat :", "Result date:") + "</b> " + fmt(exp["reviewed_at"] if exp else time.time()), N)]], colWidths=[10.5*cm, 6.5*cm])
     pat.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .6, colors.grey), ("INNERGRID", (0, 0), (-1, -1), .25, colors.lightgrey), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)])); S += [pat, Spacer(1, 8)]
     if c["notes"]: S += [Paragraph("<b>" + L("Renseignements cliniques :", "Clinical information:") + "</b> " + T(c["notes"]), N), Spacer(1, 6)]
+    rr = case_risk(c, cid); g = "en" if lang == "en" else "fr"
+    if rr["answered"]:
+        rk = [[Paragraph(RT["title"][g] + "<br/>" + T(RT["title"]["ar"]), P(9, True))],
+              [Paragraph("<b>" + RT["level"][g] + " / " + T(RT["level"]["ar"]) + " :</b> " + RT["lv"][rr["level"]][g] + " / " + T(RT["lv"][rr["level"]]["ar"]) + " (" + str(rr["score"]) + ")", N)],
+              [Paragraph("<b>" + RT["factors"][g] + " :</b> " + "; ".join(RT["f"][k][g] for k in rr["factors"]), N)],
+              [Paragraph("<b>" + RT["advice"][g] + " :</b><br/>" + "<br/>".join("• " + RT["a"][k][g] for k in rr["advice"]) + "<br/>" + "<br/>".join(T("• " + RT["a"][k]["ar"]) for k in rr["advice"]), P(8.5))]]
+        rkt = Table(rk, colWidths=[17*cm]); rkt.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .6, colors.HexColor("#b45309")), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fff7e0")), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        S += [rkt, Spacer(1, 8)]
     lbl = {"auto": "" + L("Détection IA (à valider)", "AI detection (to be validated)") + "", "confirmed": "" + L("Confirmé / identifié par l'expert", "Confirmed / identified by the expert") + ""}
     S += [Paragraph("" + L("EXAMEN MICROSCOPIQUE DIRECT / ", "DIRECT MICROSCOPIC EXAMINATION / ") + "" + T("الفحص المجهري المباشر"), P(10, True)), Spacer(1, 3)]
     rows = [["" + L("Élément parasitaire retrouvé", "Parasitic element found") + "", "" + L("Confiance IA", "AI confidence") + "", L("Statut", "Status")]] + [[Paragraph(T(x["parasite"]), N), ("-" if x["conf"] is None else "%d %%" % round(x["conf"] * 100)), lbl.get(x["status"], x["status"])] for x in fs]
@@ -525,6 +594,9 @@ def _report_pdf(cid, u, lang="fr"):
     if cells:
         S.append(Paragraph("" + L("Images analysées / ", "Analysed images / ") + "" + T("الصور المحللة"), P(9, True))); S.append(Spacer(1, 3))
         g = Table([cells[i:i + 2] + [""] * (2 - len(cells[i:i + 2])) for i in range(0, len(cells), 2)], colWidths=[8.5*cm, 8.5*cm]); S += [g, Spacer(1, 8)]
+    dsc = Table([[Paragraph("<b>" + RT["disc"]["en" if lang == "en" else "fr"] + "</b><br/>" + T(RT["disc"]["ar"]), P(8, alignment=0))]], colWidths=[17*cm])
+    dsc.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .8, colors.HexColor("#b45309")), ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fff7e0")), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+    S += [dsc, Spacer(1, 8)]
     sig = Table([[Paragraph("" + L("Le technicien / Le biologiste<br/>", "Technician / Biologist<br/>") + "" + T("التقني / البيولوجي"), P(8.5, True, alignment=TA_CENTER)),
                   Paragraph("" + L("Le médecin expert<br/>", "Expert physician<br/>") + "" + T("الطبيب الخبير") + ((" : " + T(exp["expert_name"] or "") + "<br/>" + T(exp["to_name"])) if exp else ""), P(8.5, True, alignment=TA_CENTER)),
                   Paragraph("" + L("Cachet<br/>", "Stamp<br/>") + "" + T("الختم"), P(8.5, True, alignment=TA_CENTER))], ["", "", ""]], colWidths=[5.6*cm] * 3, rowHeights=[1.9*cm, 2.2*cm])
