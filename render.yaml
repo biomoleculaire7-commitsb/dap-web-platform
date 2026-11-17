@@ -23,6 +23,10 @@ services:
         value: "1"           # comptes de démonstration ; mettre 0 pour une utilisation réelle
       - key: DAP_DEMO_PASSWORD
         sync: false
+      - key: DAP_PULSE_URL          # facultatif : adresse du backend PULSE (envoi anonymisé des parasites confirmés)
+        sync: false
+      - key: DAP_PULSE_KEY          # facultatif : clé d'API PULSE (écriture)
+        sync: false
     disk:
       name: dap-data
       mountPath: /data
