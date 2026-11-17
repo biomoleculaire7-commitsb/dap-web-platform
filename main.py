@@ -297,7 +297,9 @@ def report(rid: int, r: Report, u=Depends(user)):
         if f.get("status") in ("confirmed", "rejected"):
             q("UPDATE findings SET status=?,confirmed_by=?,confirmed_at=? WHERE id=? AND case_id=?", (f["status"], u["id"], time.time(), f["id"], ref["case_id"]))
     q("UPDATE referrals SET status='expertisé',verdict=?,report=?,expert_id=?,reviewed_at=? WHERE id=?", (r.verdict, r.report, u["id"], time.time(), rid))
-    q("UPDATE cases SET status='expertisé' WHERE id=?", (ref["case_id"],)); audit(u, "expert_report", f"case {ref['case_id']}"); return {"ok": True}
+    q("UPDATE cases SET status='expertisé' WHERE id=?", (ref["case_id"],)); audit(u, "expert_report", f"case {ref['case_id']}")
+    threading.Thread(target=pulse_push, args=(ref["case_id"],), daemon=True).start()   # sans effet si PULSE n'est pas configuré
+    return {"ok": True}
 
 @app.get("/api/classes")
 def classes(u=Depends(user)): return {"model": LABELS, "extra": EXTRA, "other": OTHER}
@@ -348,6 +350,62 @@ def save_ann(fid: int, a: AnnIn, u=Depends(user)):
     audit(u, "annotate", f"file {fid}"); return {"saved": len(lines), "negative": not lines, "review": "pending"}
 
 # ---------- Administration centrale ----------
+
+# ---------------- Carte épidémiologique (niveau wilaya) + lien optionnel vers PULSE ----------------
+import unicodedata, threading, urllib.request
+WIL = [("Adrar","أدرار",27.87,-0.29),("Chlef","الشلف",36.16,1.33),("Laghouat","الأغواط",33.80,2.88),("Oum El Bouaghi","أم البواقي",35.88,7.11),("Batna","باتنة",35.56,6.17),("Bejaia","بجاية",36.75,5.06),("Biskra","بسكرة",34.85,5.73),("Bechar","بشار",31.62,-2.22),("Blida","البليدة",36.47,2.83),("Bouira","البويرة",36.37,3.90),("Tamanrasset","تمنراست",22.79,5.52),("Tebessa","تبسة",35.40,8.12),("Tlemcen","تلمسان",34.88,-1.32),("Tiaret","تيارت",35.37,1.32),("Tizi Ouzou","تيزي وزو",36.71,4.05),("Alger","الجزائر",36.75,3.06),("Djelfa","الجلفة",34.67,3.26),("Jijel","جيجل",36.82,5.77),("Setif","سطيف",36.19,5.41),("Saida","سعيدة",34.83,0.15),("Skikda","سكيكدة",36.88,6.91),("Sidi Bel Abbes","سيدي بلعباس",35.19,-0.63),("Annaba","عنابة",36.90,7.77),("Guelma","قالمة",36.46,7.43),("Constantine","قسنطينة",36.37,6.61),("Medea","المدية",36.26,2.75),("Mostaganem","مستغانم",35.93,0.09),("M'Sila","المسيلة",35.70,4.54),("Mascara","معسكر",35.40,0.14),("Ouargla","ورقلة",31.95,5.32),("Oran","وهران",35.70,-0.63),("El Bayadh","البيض",33.68,1.02),("Illizi","إليزي",26.51,8.48),("Bordj Bou Arreridj","برج بوعريريج",36.07,4.76),("Boumerdes","بومرداس",36.76,3.48),("El Tarf","الطارف",36.77,8.31),("Tindouf","تندوف",27.67,-8.15),("Tissemsilt","تيسمسيلت",35.61,1.81),("El Oued","الوادي",33.37,6.86),("Khenchela","خنشلة",35.43,7.14),("Souk Ahras","سوق أهراس",36.28,7.95),("Tipaza","تيبازة",36.59,2.45),("Mila","ميلة",36.45,6.26),("Ain Defla","عين الدفلى",36.26,1.97),("Naama","النعامة",33.27,-0.31),("Ain Temouchent","عين تموشنت",35.30,-1.14),("Ghardaia","غرداية",32.49,3.67),("Relizane","غليزان",35.74,0.56),("El M'Ghair","المغير",33.95,5.92),("El Meniaa","المنيعة",30.58,2.88),("Ouled Djellal","أولاد جلال",34.43,5.07),("Bordj Badji Mokhtar","برج باجي مختار",21.33,0.95),("Beni Abbes","بني عباس",30.13,-2.17),("Timimoun","تيميمون",29.26,0.23),("Touggourt","تقرت",33.10,6.06),("Djanet","جانت",24.55,9.48),("In Salah","عين صالح",27.20,2.48),("In Guezzam","عين قزام",19.57,5.77)]
+def _nz(x):
+    x = unicodedata.normalize("NFKD", str(x or "")).lower()
+    x = "".join(ch for ch in x if not unicodedata.combining(ch))
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي"), ("’", "'"), ("-", " ")): x = x.replace(a, b)
+    return " ".join(x.split())
+def wilaya_xy(name):
+    n = _nz(name)
+    if not n: return None
+    for fr, ar, la, lo in sorted(WIL, key=lambda w: -len(w[0])):
+        if _nz(fr) in n or _nz(ar) in n or n in (_nz(fr), _nz(ar)): return {"name": fr, "lat": la, "lng": lo}
+    return None
+
+@app.get("/api/central/map")
+def c_map(u=Depends(central)):
+    rows = q("""SELECT l.wilaya, f.parasite, COUNT(DISTINCT f.case_id) n FROM findings f JOIN cases c ON c.id=f.case_id JOIN labs l ON l.id=c.lab_id
+                WHERE f.status='confirmed' GROUP BY l.wilaya, f.parasite""")
+    pts, unk = {}, 0
+    for r in rows:
+        w = wilaya_xy(r["wilaya"])
+        if not w: unk += r["n"]; continue
+        p = pts.setdefault(w["name"], {"wilaya": w["name"], "lat": w["lat"], "lng": w["lng"], "total": 0, "by": {}})
+        p["total"] += r["n"]; p["by"][r["parasite"]] = p["by"].get(r["parasite"], 0) + r["n"]
+    audit(u, "view_map", "")
+    return {"points": sorted(pts.values(), key=lambda p: -p["total"]), "unlocated": unk, "pulse_url": PULSE_URL, "pulse_push": bool(PULSE_URL and PULSE_KEY),
+            "pulse_sent": (q("SELECT COUNT(*) n FROM pulse_log WHERE ok=1", (), True) or {"n": 0})["n"]}
+
+# --- envoi anonymisé et optionnel vers PULSE (désactivé tant que DAP_PULSE_URL et DAP_PULSE_KEY ne sont pas définis) ---
+PULSE_URL = os.environ.get("DAP_PULSE_URL", "").rstrip("/"); PULSE_KEY = os.environ.get("DAP_PULSE_KEY", "")
+q("CREATE TABLE IF NOT EXISTS pulse_log(case_id INT, parasite, ts REAL, ok INT, PRIMARY KEY(case_id, parasite))")
+def pulse_push(cid):
+    """Envoie à PULSE (parasite, wilaya, date) pour chaque parasite confirmé. Aucun nom, âge ni identifiant patient n'est transmis."""
+    if not (PULSE_URL and PULSE_KEY): return 0
+    try:
+        c = q("SELECT c.id,c.lab_id,l.wilaya FROM cases c JOIN labs l ON l.id=c.lab_id WHERE c.id=?", (cid,), True); w = wilaya_xy(c["wilaya"]) if c else None
+        if not w: return 0
+        done = {x["parasite"] for x in q("SELECT parasite FROM pulse_log WHERE case_id=? AND ok=1", (cid,))}
+        pars = [x["parasite"] for x in q("SELECT DISTINCT parasite FROM findings WHERE case_id=? AND status='confirmed'", (cid,)) if x["parasite"] not in done]
+        if not pars: return 0
+        day = time.strftime("%Y-%m-%d")
+        items = [{"patient_id": f"DAP-{c['lab_id']}-{cid}-{p}", "disease": p, "lat": w["lat"], "lng": w["lng"], "date": day, "region": w["name"], "severity": "unknown", "origin": "DAP"} for p in pars]
+        req = urllib.request.Request(PULSE_URL + "/api/import/webhook", data=json.dumps(items).encode(), headers={"Content-Type": "application/json", "X-API-Key": PULSE_KEY}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as r: ok = 200 <= r.status < 300
+        for p in pars: q("INSERT OR REPLACE INTO pulse_log(case_id,parasite,ts,ok) VALUES(?,?,?,?)", (cid, p, time.time(), int(ok)))
+        return len(pars) if ok else 0
+    except Exception as e:
+        print("[DAP] PULSE indisponible :", type(e).__name__, flush=True); return 0
+
+@app.post("/api/central/pulse/sync")
+def pulse_sync(u=Depends(central)):
+    if not (PULSE_URL and PULSE_KEY): raise HTTPException(400, "PULSE non configuré (DAP_PULSE_URL / DAP_PULSE_KEY)")
+    n = sum(pulse_push(x["case_id"]) for x in q("SELECT DISTINCT case_id FROM findings WHERE status='confirmed'")); audit(u, "pulse_sync", str(n)); return {"sent": n}
+
 @app.get("/api/central/overview")
 def c_overview(u=Depends(central)):
     n = lambda sql: q(sql, (), True)["n"]
