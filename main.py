@@ -80,6 +80,9 @@ def seed():
         if not cp: cp = secrets.token_urlsafe(9); print(f"[DAP] Compte central créé : {ce} / {cp}  (définissez DAP_CENTRAL_PASSWORD pour le fixer)", flush=True)
         lid = q("INSERT INTO labs(name,type,wilaya,has_expert,created,status) VALUES(?,?,?,?,?,?)", ("Administration centrale DAP", "Central", "", 0, time.time(), "approved"))
         mk_user(lid, "Administrateur central", ce, cp, "central")
+    elif cp:
+        sl = secrets.token_hex(8)
+        q("UPDATE users SET email=?,salt=?,pw=? WHERE role='central'", (ce, sl, hp(cp, sl)))
     if os.environ.get("DAP_SEED_DEMO", "0") == "1" and not q("SELECT 1 FROM users WHERE email='labo@dap.local'", (), True):
         dp = os.environ.get("DAP_DEMO_PASSWORD", "demo1234")
         for name, ex, email, role, uname in [("Laboratoire Démo", 0, "labo@dap.local", "admin", "Technicien Démo"), ("Hôpital Expert Démo", 1, "expert@dap.local", "expert", "Dr Expert Démo")]:
