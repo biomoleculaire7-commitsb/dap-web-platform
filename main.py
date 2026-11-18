@@ -225,17 +225,33 @@ def case_risk(c, cid):
     return rk
 
 def case_concordance(cid):
-    """Concordance IA / expert pour un dossier : détections du modèle, confirmées, rejetées, ajoutées par l'expert."""
-    rows = q("SELECT parasite,conf,status FROM findings WHERE case_id=?", (cid,))
-    ai = [r for r in rows if r["conf"] is not None]
-    conf = sum(1 for r in ai if r["status"] == "confirmed"); rej = sum(1 for r in ai if r["status"] == "rejected")
-    pend = sum(1 for r in ai if r["status"] == "auto"); added = sum(1 for r in rows if r["conf"] is None and r["status"] == "confirmed")
+    """Concordance IA / expert d'un dossier : prédictions d'origine du modèle (ai_preds) comparées aux boîtes de l'expert (IoU >= 0,5)."""
+    fids = [r["id"] for r in q("SELECT id FROM files WHERE case_id=? AND kind='annotée'", (cid,))]
+    ai_total = conf = rej = pend = added = 0; by = {}
+    def row(lab): return by.setdefault(lab, {"parasite": lab, "ai": 0, "confirmed": 0, "rejected": 0, "pending": 0})
+    for fid in fids:
+        ai = [(r["parasite"], (r["x0"], r["y0"], r["x1"], r["y1"])) for r in q("SELECT parasite,x0,y0,x1,y1 FROM ai_preds WHERE file_id=?", (fid,))]
+        gt_all = q("SELECT label,x0,y0,x1,y1 FROM annotations WHERE file_id=?", (fid,))
+        for a in ai: row(a[0])["ai"] += 1
+        ai_total += len(ai)
+        if not gt_all:                                    # pas encore revue par l'expert
+            pend += len(ai)
+            for a in ai: row(a[0])["pending"] += 1
+            continue
+        gt = [(g["label"], (g["x0"], g["y0"], g["x1"], g["y1"])) for g in gt_all if g["label"] != NEG]
+        pairs = sorted(((_iou(a[1], g[1]), i, j) for i, a in enumerate(ai) for j, g in enumerate(gt)), reverse=True)
+        ua, ug = set(), set()
+        for v, i, j in pairs:
+            if v < 0.5: break
+            if i in ua or j in ug: continue
+            ua.add(i); ug.add(j)
+            if ai[i][0] == gt[j][0]: conf += 1; row(ai[i][0])["confirmed"] += 1
+            else: rej += 1; row(ai[i][0])["rejected"] += 1
+        for i, a in enumerate(ai):
+            if i not in ua: rej += 1; row(a[0])["rejected"] += 1
+        added += sum(1 for j in range(len(gt)) if j not in ug)
     reviewed = conf + rej
-    by = {}
-    for r in ai:
-        d = by.setdefault(r["parasite"], {"parasite": r["parasite"], "ai": 0, "confirmed": 0, "rejected": 0, "pending": 0})
-        d["ai"] += 1; d["confirmed" if r["status"] == "confirmed" else "rejected" if r["status"] == "rejected" else "pending"] += 1
-    return {"ai": len(ai), "confirmed": conf, "rejected": rej, "pending": pend, "added": added, "reviewed": reviewed,
+    return {"ai": ai_total, "confirmed": conf, "rejected": rej, "pending": pend, "added": added, "reviewed": reviewed,
             "agreement": (round(100 * conf / reviewed) if reviewed else None), "by": sorted(by.values(), key=lambda d: -d["ai"])}
 
 @app.get("/api/followups")
