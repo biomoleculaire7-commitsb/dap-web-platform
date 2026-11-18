@@ -54,6 +54,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--p2);box-
 .row>[style*="flex:0 0 240px"]{flex:0 0 110px!important;min-width:0}.row>[style*="flex:0 0 40px"]{flex:0 0 28px!important;min-width:0}.row[style*="align-items:center"]>div:nth-child(2){min-width:0}
 .steps{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.st{flex-direction:column;text-align:center;min-width:0;padding:8px 4px;gap:4px;font-size:12px}
 .kps{grid-template-columns:repeat(3,1fr)}.kp{padding:10px}.kp b{font-size:20px}}
+#cv{max-height:80vh;width:auto;height:auto}#md{padding-bottom:86px}
+#md .acts{position:fixed;inset-inline:0;bottom:0;z-index:60;background:var(--c);border-top:1px solid var(--b);box-shadow:0 -4px 16px #0f172a33;padding:10px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}#md .acts button{margin:0}
+@media(max-width:700px){#cv{max-height:48vh}#md{padding:8px 8px 86px}#md .in{padding:10px}}
 </style></head><body><div id="app"></div><script src="config.js"></script>
 <script>
 const $=s=>document.querySelector(s);const API=(window.DAP_API||'').replace(/\/$/,'');
@@ -225,7 +228,7 @@ async function openAnn(fid,ro){if(!CL)CL=await api('/classes');const ex=await ap
  AN={fid,img,W,H,s,bx,sel:-1,drag:null,last:CL.model[0],ro};
  $('#md')?.remove();
  const help=ro?'':`<div class=tl><button class=s onclick="$('#hlp').style.display=$('#hlp').style.display=='block'?'none':'block'">ℹ️ ${t('h_btn')}</button></div><div id=hlp style="display:none;background:var(--bg);border:1px solid var(--b);border-radius:10px;padding:10px 14px;font-size:13px;line-height:1.5"><b>${t('h_title')}</b>${t('h_html')}</div>`;
- document.body.insertAdjacentHTML('beforeend',`<div id=md><div class=in><div><canvas id=cv width=${Math.round(W*s)} height=${Math.round(H*s)}></canvas>${ro?'':`<div class=m>${t('an_hint')}</div>`}</div><div class=side><h3>${t('an_title')}</h3>${help}<div id=bl></div><p>${ro?`<button onclick="arev(${fid},'approve')">${t('approve')}</button> <button class=r onclick="arev(${fid},'reject')">${t('rejectA')}</button> `:`<button onclick="saveAnn()">💾 ${t('an_save')}</button> `}<button class=s onclick="closeAnn()">${t('close')}</button></p><div id=an-ok class=m></div></div></div></div>`);
+ document.body.insertAdjacentHTML('beforeend',`<div id=md><div class=in><div><canvas id=cv width=${Math.round(W*s)} height=${Math.round(H*s)}></canvas>${ro?'':`<div class=m>${t('an_hint')}</div>`}</div><div class=side><h3>${t('an_title')}</h3>${help}<div id=bl></div></div></div><div class=acts>${ro?`<button onclick="arev(${fid},'approve')">${t('approve')}</button> <button class=r onclick="arev(${fid},'reject')">${t('rejectA')}</button> `:`<button onclick="saveAnn()">💾 ${t('an_save')}</button> `}<button class=s onclick="closeAnn()">✕ ${t('close')}</button> <span id=an-ok class=m></span></div></div>`);
  const cv=$('#cv'),pos=e=>{const r=cv.getBoundingClientRect();return[(e.clientX-r.left)*cv.width/r.width/AN.s,(e.clientY-r.top)*cv.height/r.height/AN.s]};
  if(!ro){cv.onpointerdown=e=>{cv.setPointerCapture(e.pointerId);AN.drag=pos(e).concat(pos(e))};
  cv.onpointermove=e=>{if(AN.drag){const p=pos(e);AN.drag[2]=p[0];AN.drag[3]=p[1];draw()}};
