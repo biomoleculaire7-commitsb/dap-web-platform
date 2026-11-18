@@ -208,9 +208,48 @@ def risk_eval(raw, age, positive=False):
         if positive: adv.append("treat")
     return {"answered": answered, "score": score, "level": level, "factors": factors, "advice": adv, "positive": positive, "inputs": r}
 
+# Intervalle (en mois) proposé avant le prochain dépistage, selon le niveau de risque. Règle simple, non diagnostique, à valider par le médecin.
+FU_MONTHS = {"low": 12, "moderate": 6, "high": 3}
+
+def follow_plan(rk, created):
+    """Échéancier de suivi préventif (règles simples). Après un résultat positif, le suivi est décidé par le médecin."""
+    if rk["positive"]: return {"kind": "physician", "months": None, "due": None}
+    if not rk["answered"]: return {"kind": None, "months": None, "due": None}
+    m = FU_MONTHS[rk["level"]]
+    return {"kind": "scheduled", "months": m, "due": float(created or time.time()) + m * 30.4375 * 86400}
+
 def case_risk(c, cid):
     pos = bool(q("SELECT 1 FROM findings WHERE case_id=? AND status!='rejected' LIMIT 1", (cid,)))
-    return risk_eval(c.get("risk"), c.get("age"), pos)
+    rk = risk_eval(c.get("risk"), c.get("age"), pos)
+    rk["follow"] = follow_plan(rk, c.get("created"))
+    return rk
+
+def case_concordance(cid):
+    """Concordance IA / expert pour un dossier : détections du modèle, confirmées, rejetées, ajoutées par l'expert."""
+    rows = q("SELECT parasite,conf,status FROM findings WHERE case_id=?", (cid,))
+    ai = [r for r in rows if r["conf"] is not None]
+    conf = sum(1 for r in ai if r["status"] == "confirmed"); rej = sum(1 for r in ai if r["status"] == "rejected")
+    pend = sum(1 for r in ai if r["status"] == "auto"); added = sum(1 for r in rows if r["conf"] is None and r["status"] == "confirmed")
+    reviewed = conf + rej
+    by = {}
+    for r in ai:
+        d = by.setdefault(r["parasite"], {"parasite": r["parasite"], "ai": 0, "confirmed": 0, "rejected": 0, "pending": 0})
+        d["ai"] += 1; d["confirmed" if r["status"] == "confirmed" else "rejected" if r["status"] == "rejected" else "pending"] += 1
+    return {"ai": len(ai), "confirmed": conf, "rejected": rej, "pending": pend, "added": added, "reviewed": reviewed,
+            "agreement": (round(100 * conf / reviewed) if reviewed else None), "by": sorted(by.values(), key=lambda d: -d["ai"])}
+
+@app.get("/api/followups")
+def followups(u=Depends(user)):
+    """Échéancier du laboratoire : dépistages préventifs à planifier (uniquement ses propres dossiers)."""
+    if u["role"] == "central": raise HTTPException(403)
+    now = time.time(); out = []
+    for c in q("SELECT * FROM cases WHERE lab_id=? ORDER BY id DESC LIMIT 500", (u["lab_id"],)):
+        rk = case_risk(c, c["id"]); f = rk["follow"]
+        if f["kind"] != "scheduled": continue
+        out.append({"id": c["id"], "patient_ref": c["patient_ref"], "age": c["age"], "level": rk["level"], "months": f["months"], "due": f["due"],
+                    "days": int((f["due"] - now) // 86400), "overdue": f["due"] < now})
+    out.sort(key=lambda x: x["due"])
+    return {"items": out, "overdue": sum(1 for x in out if x["overdue"]), "soon": sum(1 for x in out if 0 <= x["days"] <= 30)}
 
 @app.post("/api/cases")
 def new_case(c: NewCase, u=Depends(user)):
@@ -228,7 +267,7 @@ def case(cid: int, u=Depends(user)):
     refs = q("SELECT r.*,a.name from_name,b.name to_name,(SELECT name FROM users WHERE id=r.expert_id) expert_name FROM referrals r JOIN labs a ON a.id=r.from_lab JOIN labs b ON b.id=r.to_lab WHERE case_id=? ORDER BY r.id DESC", (cid,))
     can_review = any(r["to_lab"] == u["lab_id"] and r["status"] == "en_attente" for r in refs) and u["role"] in ("expert", "admin")
     return {"case": c, "own": own, "files": q("SELECT id,name,kind,parent FROM files WHERE case_id=?", (cid,)),
-            "findings": q("SELECT id,file_id,parasite,conf,status,box FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review, "risk_result": case_risk(c, cid)}
+            "findings": q("SELECT id,file_id,parasite,conf,status,box FROM findings WHERE case_id=?", (cid,)), "referrals": refs, "can_review": can_review, "risk_result": case_risk(c, cid), "concordance": case_concordance(cid)}
 
 @app.post("/api/cases/{cid}/files")
 async def upload(cid: int, files: List[UploadFile] = File(default=[]), u=Depends(user)):
@@ -589,6 +628,10 @@ RT = {
        "repeat": {"fr": "Un résultat négatif n'exclut pas une infection : répéter l'examen des selles (échantillons de jours différents) si les symptômes persistent.", "en": "A negative result does not rule out infection: repeat the stool examination (samples from different days) if symptoms persist.", "ar": "النتيجة السلبية لا تنفي العدوى: أعد فحص البراز (عينات من أيام مختلفة) إذا استمرت الأعراض."},
        "anemia": {"fr": "Rechercher une anémie auprès d'un médecin.", "en": "Have anaemia checked by a physician.", "ar": "يُفحص فقر الدم لدى الطبيب."},
        "treat": {"fr": "Parasite détecté : traitement et suivi décidés par un médecin.", "en": "Parasite detected: treatment and follow-up to be decided by a physician.", "ar": "تم الكشف عن طفيلي: العلاج والمتابعة يقررهما الطبيب."}},
+ "fu": {"fr": "Prochain dépistage suggéré", "en": "Suggested next screening", "ar": "موعد الفحص الوقائي المقترح"},
+ "fu_ph": {"fr": "Suivi et traitement décidés par un médecin.", "en": "Follow-up and treatment to be decided by a physician.", "ar": "المتابعة والعلاج يقررهما الطبيب."},
+ "fu_note": {"fr": "Échéance indicative à valider par un professionnel de santé.", "en": "Indicative date, to be validated by a healthcare professional.", "ar": "موعد استرشادي يؤكده مختص صحي."},
+ "mo": {"fr": "mois", "en": "months", "ar": "أشهر"},
  "disc": {"fr": "Dépistage assisté par IA : ce n'est pas un diagnostic clinique définitif. Il doit être confirmé par un professionnel de santé qualifié ; en cas de symptômes ou de résultat positif, orienter le patient vers un médecin.",
           "en": "AI-assisted screening: this is not a definitive clinical diagnosis. It must be confirmed by a qualified healthcare professional; in case of symptoms or a positive result, refer the patient to a physician.",
           "ar": "فحص مدعوم بالذكاء الاصطناعي: ليس تشخيصًا سريريًا نهائيًا. يجب أن يؤكده مختص صحي مؤهل؛ وعند وجود أعراض أو نتيجة إيجابية يُحال المريض إلى طبيب."},
@@ -628,6 +671,9 @@ def _report_pdf(cid, u, lang="fr"):
               [Paragraph("<b>" + RT["level"][g] + " / " + T(RT["level"]["ar"]) + " :</b> " + RT["lv"][rr["level"]][g] + " / " + T(RT["lv"][rr["level"]]["ar"]) + " (" + str(rr["score"]) + ")", N)],
               [Paragraph("<b>" + RT["factors"][g] + " :</b> " + "; ".join(RT["f"][k][g] for k in rr["factors"]), N)],
               [Paragraph("<b>" + RT["advice"][g] + " :</b><br/>" + "<br/>".join("• " + RT["a"][k][g] for k in rr["advice"]) + "<br/>" + "<br/>".join(T("• " + RT["a"][k]["ar"]) for k in rr["advice"]), P(8.5))]]
+        fl = rr["follow"]
+        if fl["kind"] == "scheduled": rk.append([Paragraph("<b>" + RT["fu"][g] + " / " + T(RT["fu"]["ar"]) + " :</b> " + fmt(fl["due"]) + " (" + str(fl["months"]) + " " + RT["mo"][g] + ")<br/>" + RT["fu_note"][g] + "<br/>" + T(RT["fu_note"]["ar"]), N)])
+        elif fl["kind"] == "physician": rk.append([Paragraph("<b>" + RT["fu"][g] + " / " + T(RT["fu"]["ar"]) + " :</b> " + RT["fu_ph"][g] + "<br/>" + T(RT["fu_ph"]["ar"]), N)])
         rkt = Table(rk, colWidths=[17*cm]); rkt.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), .6, colors.HexColor("#b45309")), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fff7e0")), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
         S += [rkt, Spacer(1, 8)]
     lbl = {"auto": "" + L("Détection IA (à valider)", "AI detection (to be validated)") + "", "confirmed": "" + L("Confirmé / identifié par l'expert", "Confirmed / identified by the expert") + ""}
